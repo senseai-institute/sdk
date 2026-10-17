@@ -27,6 +27,8 @@ from senseai_sdk.errors import LicenceError, PipelineError
 from senseai_sdk.health import Health, StageHealth
 from senseai_sdk.licence import Licence, Meter
 from senseai_sdk.pipeline import Pipeline, StepResult
+from senseai_sdk.telemetry import Telemetry
+from senseai_sdk.threaded import ThreadedRunner
 
 if TYPE_CHECKING:
     from senseai_sdk.bridges import BridgeLike
@@ -114,9 +116,12 @@ class SenseAI:
             device=device,
         )
         self._pipeline.taps.append(self._meter_tick)
+        self.telemetry = Telemetry(cfg.telemetry, cfg.endpoint_id, cfg.artefacts.cache / "telemetry")
+        self._runner: ThreadedRunner | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._senses_checked = False
+        self._lock = threading.Lock()
 
     @staticmethod
     def _grace() -> int:
@@ -221,42 +226,58 @@ class SenseAI:
     # -- running ------------------------------------------------------------------------
 
     def run(self) -> None:
-        """Run the pipeline in the foreground until :meth:`stop`, SIGINT or end of replay."""
-        self._stop.clear()
+        """Run the pipeline in the foreground until :meth:`stop`, SIGINT or end of replay.
+
+        This is threaded mode: one thread per stage with bounded drop-oldest queues, and a
+        reflex thread on the wall clock so the controller gets a command every tick even if an
+        upstream stage stalls. Recordings replay at real time.
+        """
+        self.start()
         try:
-            while not self._stop.is_set():
-                try:
-                    self.step()
-                except StopIteration:
-                    break
+            r = self._runner
+            while r is not None and not self._stop.is_set() and not r.finished:
+                self._stop.wait(0.05)
         except KeyboardInterrupt:
             pass
         finally:
-            self._shutdown()
+            self.stop()
 
     def start(self) -> None:
-        """Start the pipeline on a background thread and return immediately."""
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self.run, name="senseai-pipeline", daemon=True)
-        self._thread.start()
+        """Start the pipeline in threaded mode on background threads and return immediately."""
+        with self._lock:
+            if self._runner is not None:
+                return
+            self._stop.clear()
+            self._check_senses(paced=True)
+            self.telemetry.attach(self._pipeline)
+            self._runner = ThreadedRunner(self._pipeline)
+            self._runner.start()
 
     def stop(self) -> None:
         """Stop the pipeline: final ``hold`` on the bridge, sinks flushed, usage metered, devices closed.
 
-        Idempotent. Returns once the pipeline thread has finished.
+        Idempotent. Returns once the pipeline threads have finished.
         """
         self._stop.set()
-        t = self._thread
-        if t is not None and t.is_alive() and t is not threading.current_thread():
-            t.join()
-        self._thread = None
+        with self._lock:
+            r, self._runner = self._runner, None
+        if r is not None:
+            r.stop()
+            r.drops()
         self._shutdown()
 
     def _shutdown(self) -> None:
+        self.telemetry.close()
         self._pipeline.close()
         if self.meter.counts()["ticks"]:
             self.meter.report()
+
+    def _check_senses(self, *, paced: bool) -> None:
+        self._pipeline.open(paced=paced)
+        if self._senses_checked:
+            return
+        self.licence.require_senses(str(s.modality) for s in self._pipeline.ingest.specs().values())
+        self._senses_checked = True
 
     def step(self) -> StepResult:
         """Run exactly one tick through every stage, in order, on the calling thread.
@@ -270,10 +291,11 @@ class SenseAI:
             LicenceError: A configured sensor's modality is not licensed (checked when
                 devices open, since replay adapters only report their modality then).
         """
+        if self._runner is not None:
+            raise PipelineError("step() cannot be mixed with start()/run(); call stop() first")
         if not self._senses_checked:
-            self._pipeline.open()
-            self.licence.require_senses(str(s.modality) for s in self._pipeline.ingest.specs().values())
-            self._senses_checked = True
+            self._check_senses(paced=False)
+            self.telemetry.attach(self._pipeline)
         return self._pipeline.step()
 
     # -- observability ------------------------------------------------------------------

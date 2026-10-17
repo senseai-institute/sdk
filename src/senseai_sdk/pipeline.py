@@ -274,8 +274,10 @@ class Pipeline:
 
         ``paced`` replays recordings at real time (threaded mode); otherwise as fast as possible.
         """
-        if self._opened:
+        if self._opened and self.ingest.paced == paced:
             return
+        if self._opened:  # re-open in the other pacing mode (replay only; live sources ignore pacing)
+            self.ingest.close()
         self.ingest.open(paced=paced)
         self.tokens.set_specs(self.ingest.specs())
         self._opened = True
@@ -479,7 +481,7 @@ class Pipeline:
         stages.append(self.sdk_stats.snapshot())
         reasons = list(self._last_reasons)
         for s in stages:
-            if not s.available and s.reason:
+            if not s.available and s.reason and s.reason not in reasons:
                 reasons.append(s.reason)
         lic, days = self._licence_state()
         state: Any = "ok"

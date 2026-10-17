@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from senseai_sdk.cli import main
+from senseai_sdk.config import Config
 from tests.conftest import base_config
 
 
@@ -118,8 +119,41 @@ def test_profiles_list_show(config_path: Path, capsys: pytest.CaptureFixture[str
     assert main(["profiles", "show", "hawk", "--config", str(config_path)]) == 1
 
 
+def test_bench(config_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out_file = tmp_path / "bench.json"
+    rc = main(
+        ["bench", "--config", str(config_path), "--warmup", "5", "--device", "cpu", "--out", str(out_file)]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "end-to-end" in out and "sdk" in out and "45 ticks" in out
+    assert "senseai-reflex not installed" in out
+    data = json.loads(out_file.read_text())
+    assert data["stages"]["world"]["p99_ms"] > 0 and data["sdk_overhead_p99_ms"] >= 0
+    assert main(["bench", "--config", str(config_path), "--max-ticks", "10", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["ticks"] == 0  # 10 ticks all inside the 20-tick warm-up
+
+
+def test_bench_on_tick_file(config: Config, tmp_path: Path) -> None:
+    """``--ticks t.h5``: an ingest tick file replaces the sensors."""
+    from senseai_ingest.sync import Aligner, AlignerConfig
+    from senseai_ingest.writer import write_ticks
+
+    from senseai_sdk import adapters
+    from senseai_sdk.bench import run_bench
+
+    ads = [adapters.build(s.adapter, s.id, s.options) for s in config.sensors]
+    al = Aligner(ads, AlignerConfig(tick_ns=config.tick_ns, speed=0.0))
+    al.open()
+    ticks = list(al)
+    tf = tmp_path / "ticks.h5"
+    write_ticks(tf, ticks, al.specs(), tick_ns=config.tick_ns)
+    al.close()
+    res = run_bench(config, ticks_file=tf, warmup=5, device="cpu")
+    assert res.ticks == 45 and "world" in res.stages
+
+
 def test_not_yet_commands(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["bench"]) == 3
     assert main(["calibrate"]) == 3
     assert main(["logs", "tail"]) == 3
     assert "not implemented" in capsys.readouterr().err

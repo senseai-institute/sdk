@@ -172,6 +172,24 @@ def _profiles(a: argparse.Namespace) -> int:
     return 0
 
 
+def _bench(a: argparse.Namespace) -> int:
+    from senseai_sdk.bench import main_json, run_bench
+    from senseai_sdk.config import Config
+
+    cfg = Config.load(a.config)
+    res = run_bench(
+        cfg,
+        ticks_file=Path(a.ticks) if a.ticks else None,
+        max_ticks=a.max_ticks,
+        warmup=a.warmup,
+        device=a.device,
+    )
+    print(main_json(res) if a.json else res.table())
+    if a.out:
+        Path(a.out).write_text(main_json(res))
+    return 0
+
+
 def _not_yet(what: str) -> int:
     print(f"senseai {what}: not implemented in this build", file=sys.stderr)
     return 3
@@ -220,7 +238,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default="senseai.yaml")
     p.set_defaults(fn=_profiles)
 
-    for name in ("bench", "calibrate", "logs"):
+    p = sub.add_parser("bench", help="sensor-to-actuator latency on this machine")
+    p.add_argument("--config", default="senseai.yaml")
+    p.add_argument("--ticks", default=None, help="an ingest ticks.h5 to replay instead of the sensors")
+    p.add_argument("--max-ticks", type=int, default=None)
+    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--out", default=None)
+    p.set_defaults(fn=_bench)
+
+    for name in ("calibrate", "logs"):
         p = sub.add_parser(name)
         p.add_argument("rest", nargs="*")
         p.set_defaults(fn=lambda a, n=name: _not_yet(n))

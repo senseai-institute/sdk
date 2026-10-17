@@ -23,13 +23,13 @@ def test_quickstart_shape(config_path: Path) -> None:
     sai = SenseAI(config_path, today=TODAY)
     sai.on_command(cmds.append)
     sai.on_event(lambda ev: None)
-    sai.run()
-    assert len(cmds) == 50
+    sai.run()  # threaded: 50 ticks of data plus a few wall-clock watchdog ticks around them
+    assert len(cmds) >= 50
     h = sai.health()
-    assert h.ticks == 50 and h.licence == "valid"
+    assert h.ticks == len(cmds) and h.licence == "valid"
     assert h.artefacts == {"world": "world-v0.0", "reflex": "reflex-v0.0"}
-    assert sai.meter.reports and sai.meter.reports[0]["ticks"] == {"null": 50}
-    assert sai.meter.reports[0]["senses"]["null"]["event"] == 50
+    assert sai.meter.reports and sai.meter.reports[0]["ticks"] == {"null": len(cmds)}
+    assert sai.meter.reports[0]["senses"]["null"]["event"] == len(cmds)
 
 
 def test_start_stop(config_path: Path) -> None:
@@ -37,9 +37,28 @@ def test_start_stop(config_path: Path) -> None:
     sai.start()
     sai.start()  # idempotent
     time.sleep(0.3)
+    with pytest.raises(PipelineError, match="cannot be mixed"):
+        sai.step()
     sai.stop()
     sai.stop()
     assert sai.health().ticks > 0
+
+
+def test_run_is_threaded_and_telemetry_spools(
+    store: Path, tmp_path: Path, trust_release_key: None, licence_key: str
+) -> None:
+    p = tmp_path / "s.yaml"
+    p.write_text(
+        yaml.safe_dump(
+            base_config(store, tmp_path / "cache", licence_key=licence_key, telemetry={"enabled": True})
+        )
+    )
+    sai = SenseAI(p, today=TODAY)
+    t0 = time.monotonic()
+    sai.run()
+    assert time.monotonic() - t0 >= 0.4  # replayed at real time: 0.5 s of data
+    assert sai.health().ticks >= 50
+    assert list((tmp_path / "cache" / "telemetry").glob("telemetry-*.jsonl"))
 
 
 def test_step_and_state(config_path: Path, tmp_path: Path) -> None:
