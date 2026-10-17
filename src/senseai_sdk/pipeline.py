@@ -71,6 +71,8 @@ class StepResult:
     tick: Any | None = None  # the AlignedTick, only when Pipeline.keep_ticks (telemetry raw_frames)
     t_sensor_ns: int | None = None  # oldest sample time in the tick (master clock), None without data
     t_emit_ns: int = 0  # wall clock (time.time_ns) when the command left the reflex, before the bridge
+    world_mode: str = "learned"  # provenance: which world produced ``surprise`` (learned | prior | fused)
+    world_model_id: str = ""  # provenance: its model id (e.g. "prior-v0", "<ckpt id>+prior-v0")
 
 
 class Pipeline:
@@ -142,13 +144,36 @@ class Pipeline:
         store = store or ArtefactStore(cfg.artefacts.store, cfg.artefacts.cache)
         world_art = store.fetch(cfg.artefacts.world)
         reflex_art = store.fetch(cfg.artefacts.reflex)
-        for name in ("checkpoint.ckpt", "tokens.yaml"):
+        mode = cfg.world.mode
+        needed = ("tokens.yaml",) if mode == "prior" else ("checkpoint.ckpt", "tokens.yaml")
+        for name in needed:
             if name not in world_art.files:
-                raise ArtefactError(f"{world_art.id}: world artefact has no {name}")
+                raise ArtefactError(f"{world_art.id}: world artefact has no {name} (world.mode: {mode})")
         tokens = TokensStage(
             world_art, load_calibration(cfg.sensors), device="cpu" if device == "auto" else device
         )
-        world = WorldStage(world_art, device=device)
+        library = cfg.world.library
+        profile_art: Artefact | None = None
+        if mode in ("prior", "fused") and library is None and "library.yaml" not in world_art.files:
+            # default library: the felidae entry the profile artefact carries
+            try:
+                profile_art = store.fetch(
+                    profile_artefact_id(cfg.profile.name, cfg.profile.version)
+                    if cfg.profile.version is not None and cfg.profile.name != "null"
+                    else profile_artefact_id(cfg.profile.name, 0)
+                )
+            except ArtefactError:
+                profile_art = None
+            if profile_art is not None and "library/felidae.yaml" in profile_art.files:
+                library = profile_art.path("library/felidae.yaml")
+        world = WorldStage(
+            world_art,
+            device=device,
+            mode=mode,
+            library=library,
+            tokenizer_id=tokens.tokenizer_id,
+            tick_ns=cfg.tick_ns,
+        )
         if world.tick_ns != cfg.tick_ns:
             raise ArtefactError(
                 f"tick_ms: config says {cfg.tick_ms} ms but {world_art.id} was trained at "
@@ -371,6 +396,8 @@ class Pipeline:
             tick=tick if self.keep_ticks else None,
             t_sensor_ns=t_sensor,
             t_emit_ns=t_emit,
+            world_mode=self.world.mode,
+            world_model_id=self.world.model_id,
         )
         self.finish_tick(res, t_start)
         return res
@@ -509,7 +536,7 @@ class Pipeline:
             watchdog=self.reflex.watchdog,
             licence=lic,  # type: ignore[arg-type]
             licence_days_left=days,
-            artefacts={k: a.id for k, a in self.artefacts.items()},
+            artefacts={**{k: a.id for k, a in self.artefacts.items()}, **self.world.describe()},
             profile=self.profiles.active_ref,
             ticks=self.ticks,
             reasons=reasons,

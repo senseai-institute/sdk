@@ -242,6 +242,8 @@ class ThreadedRunner:
                     tick=tick if p.keep_ticks else None,
                     t_sensor_ns=t_sensor,
                     t_emit_ns=t_emit,
+                    world_mode=p.world.mode,
+                    world_model_id=p.world.model_id,
                 )
                 p.finish_tick(res, t_start)
                 self.results.append(res)

@@ -75,8 +75,15 @@ def build_fixture_store(
     world_checkpoint: Path | None = None,
     tokens_yaml: Path | None = None,
     reflex_yaml: Path | None = None,
+    world_mode: str = "learned",
+    library: Path | None = None,
 ) -> Path:
     """Write signed artefacts under ``root`` and return it.
+
+    ``world_mode="prior"`` builds a world artefact with **no checkpoint**: ``tokens.yaml``,
+    ``world.yaml`` and ``library.yaml`` (the felidae entry from the profiles repo, or
+    ``library``). ``"fused"`` carries the checkpoint and the library. ``"learned"`` (default)
+    is the checkpoint only.
 
     By default the world artefact is a tiny *untrained* model over ``TOKENS_YAML`` (with
     ``sources`` replacing its source list when given). Pass ``world_checkpoint`` and
@@ -91,10 +98,26 @@ def build_fixture_store(
     from senseai_world.config import WorldConfig
     from senseai_world.model.net import WorldNet
 
+    if world_mode not in ("learned", "prior", "fused"):
+        raise ValueError(f"world_mode must be learned, prior or fused, not {world_mode!r}")
+    repo = profiles_repo or PROFILES_REPO
     root.mkdir(parents=True, exist_ok=True)
     w = root / "world-v0.0"
     w.mkdir()
-    if world_checkpoint is not None:
+    if world_mode in ("prior", "fused"):
+        lib = library if library is not None else repo / "library" / "felidae.yaml"
+        if not lib.is_file():
+            raise FileNotFoundError(f"species library entry not found: {lib}")
+        shutil.copy(lib, w / "library.yaml")
+    if world_mode == "prior":
+        tcfg = dict(TOKENS_YAML, sources=list(sources)) if sources is not None else TOKENS_YAML
+        if tokens_yaml is not None:
+            shutil.copy(tokens_yaml, w / "tokens.yaml")
+        else:
+            (w / "tokens.yaml").write_text(yaml.safe_dump(tcfg))
+        (w / "world.yaml").write_text(yaml.safe_dump({k: v for k, v in WORLD_CFG.items() if k != "runtime"}))
+        _sign(w, "world-v0.0", key, {"tick_ms": 10, "mode": "prior"})
+    elif world_checkpoint is not None:
         if tokens_yaml is None:
             raise ValueError("world_checkpoint needs the tokens_yaml it was trained against")
         shutil.copy(tokens_yaml, w / "tokens.yaml")
@@ -116,6 +139,8 @@ def build_fixture_store(
         )
         save_checkpoint(w / "checkpoint.ckpt", WorldNet(wcfg), provenance={"tokenizer_id": tok.tokenizer_id})
         _sign(w, "world-v0.0", key, {"tick_ms": 10, "d_model": D_MODEL})
+    if world_mode != "prior" and world_checkpoint is None:
+        pass  # learned/fused fixture: the tiny untrained checkpoint above
     r = root / "reflex-v0.0"
     r.mkdir()
     if reflex_yaml is not None:
@@ -123,7 +148,6 @@ def build_fixture_store(
     else:
         (r / "reflex.yaml").write_text("motion: {horizon_s: 1.5}\n")
     _sign(r, "reflex-v0.0", key)
-    repo = profiles_repo or PROFILES_REPO
     pkg = repo / "packages" / "senseai-profiles"
     if not pkg.is_dir():
         raise FileNotFoundError(f"profiles repository not found at {repo}; set SENSEAI_PROFILES_REPO")
