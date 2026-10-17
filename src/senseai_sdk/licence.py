@@ -138,7 +138,9 @@ class Licence:
         """Raise unless the profile is allowed."""
         if not self.allows_profile(name):
             allowed = ", ".join(self.profiles or ())
-            raise LicenceError(f"licence {self.licence_id} does not allow profile {name!r} (allows {allowed})")
+            raise LicenceError(
+                f"licence {self.licence_id} does not allow profile {name!r} (allows {allowed})"
+            )
 
     def require_senses(self, modalities: Iterable[str]) -> None:
         """Raise unless every modality is allowed."""
