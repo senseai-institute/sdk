@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,21 +13,9 @@ from typing import Any
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from tests import conftest
-
 from senseai_sdk.artefacts import Keyring
-
-
-class _Factory:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    def mktemp(self, name: str) -> Path:
-        d = self.root / name
-        d.mkdir()
-        return d
+from senseai_sdk.testing import build_fixture_store, issue_test_licence
+from senseai_sdk.testing import fixture_config as _cfg
 
 
 @contextmanager
@@ -37,12 +24,9 @@ def fixture_config(seconds: float = 2.0, **over: Any) -> Iterator[Path]:
     key = Ed25519PrivateKey.generate()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        store = conftest.store.__wrapped__(_Factory(root), key)  # type: ignore[attr-defined]
+        store = build_fixture_store(root / "store", key)
         os.environ["SENSEAI_RELEASE_KEYS"] = Keyring.from_private(key).public_hex()[0]
-        lic = conftest.licence_key.__wrapped__(key)  # type: ignore[attr-defined]
-        d = conftest.base_config(store, root / "cache", licence_key=lic, **over)
-        for s in d["sensors"]:
-            s["duration_s"] = seconds
+        d = _cfg(store, root / "cache", licence_key=issue_test_licence(key), seconds=seconds, **over)
         p = root / "senseai.yaml"
         p.write_text(yaml.safe_dump(d))
         yield p

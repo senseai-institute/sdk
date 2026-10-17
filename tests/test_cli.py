@@ -153,7 +153,11 @@ def test_bench_on_tick_file(config: Config, tmp_path: Path) -> None:
     assert res.ticks == 45 and "world" in res.stages
 
 
-def test_not_yet_commands(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["calibrate"]) == 3
-    assert main(["logs", "tail"]) == 3
-    assert "not implemented" in capsys.readouterr().err
+def test_logs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    f = tmp_path / "events.jsonl"
+    f.write_text('{"text": "one"}\n{"text": "two"}\n')
+    assert main(["logs", "tail", str(f)]) == 0
+    assert capsys.readouterr().out.count("text") == 2
+    assert main(["logs", "tail", str(tmp_path / "missing.jsonl")]) == 1
+    assert main(["logs", "explain", "--at", "6.21"]) == 3
+    assert "senseai-reflex" in capsys.readouterr().err

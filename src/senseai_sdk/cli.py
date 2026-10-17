@@ -216,9 +216,30 @@ def _calibrate(a: argparse.Namespace) -> int:
     return 0
 
 
-def _not_yet(what: str) -> int:
-    print(f"senseai {what}: not implemented in this build", file=sys.stderr)
-    return 3
+def _logs(a: argparse.Namespace) -> int:
+    """``logs tail <file>`` follows a cortex/telemetry JSONL file; ``logs explain --at T`` needs reflex."""
+    if a.action == "explain":
+        print(
+            "senseai logs explain: the reflex audit log lives in senseai-reflex, which is not installed yet",
+            file=sys.stderr,
+        )
+        return 3
+    path = Path(a.file)
+    if not path.is_file():
+        print(f"{path}: no such file", file=sys.stderr)
+        return 1
+    import time
+
+    with path.open() as f:
+        for line in f:
+            print(line.rstrip())
+        while a.follow:
+            line = f.readline()
+            if line:
+                print(line.rstrip())
+            else:
+                time.sleep(0.2)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -284,15 +305,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(fn=_calibrate)
 
-    for name in ("logs",):
-        p = sub.add_parser(name)
-        p.add_argument("rest", nargs="*")
-        p.set_defaults(fn=lambda a, n=name: _not_yet(n))
+    p = sub.add_parser("logs", help="tail <events.jsonl> | explain --at T")
+    p.add_argument("action", choices=["tail", "explain"])
+    p.add_argument("file", nargs="?", default="events.jsonl")
+    p.add_argument("--at", type=float, default=None)
+    p.add_argument("--follow", "-f", action="store_true")
+    p.set_defaults(fn=_logs)
     return ap
+
+
+def _logs_to_stderr() -> None:
+    """Keep stdout for the command's own output: upstream packages log through structlog."""
+    try:
+        import structlog
+    except ImportError:  # pragma: no cover
+        return
+
+    class _Stderr:  # resolves sys.stderr at write time, so a redirected stream is honoured
+        def write(self, s: str) -> int:
+            return sys.stderr.write(s)
+
+        def flush(self) -> None:
+            sys.stderr.flush()
+
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=_Stderr()))  # type: ignore[arg-type]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point."""
+    _logs_to_stderr()
     args = build_parser().parse_args(argv)
     try:
         code: int = args.fn(args)

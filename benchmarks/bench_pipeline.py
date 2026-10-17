@@ -17,24 +17,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from tests import conftest
 
 from senseai_sdk.artefacts import Keyring
 from senseai_sdk.bench import run_bench
 from senseai_sdk.config import Config
-
-
-class _Factory:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    def mktemp(self, name: str) -> Path:
-        d = self.root / name
-        d.mkdir()
-        return d
+from senseai_sdk.testing import build_fixture_store, fixture_config, issue_test_licence
 
 
 def main() -> int:
@@ -46,13 +34,11 @@ def main() -> int:
     key = Ed25519PrivateKey.generate()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        store = conftest.store.__wrapped__(_Factory(root), key)  # type: ignore[attr-defined]
+        store = build_fixture_store(root / "store", key)
         os.environ["SENSEAI_RELEASE_KEYS"] = Keyring.from_private(key).public_hex()[0]
-        lic = conftest.licence_key.__wrapped__(key)  # type: ignore[attr-defined]
-        d = conftest.base_config(store, root / "cache", licence_key=lic)
-        seconds = a.ticks * 0.01 + 1.0
-        for s in d["sensors"]:
-            s["duration_s"] = seconds
+        d = fixture_config(
+            store, root / "cache", licence_key=issue_test_licence(key), seconds=a.ticks * 0.01 + 1.0
+        )
         cfg = Config.from_mapping(d, env={}, base=root)
         res = run_bench(cfg, max_ticks=a.ticks, device=a.device)
     if a.json:
