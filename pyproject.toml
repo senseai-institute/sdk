@@ -71,7 +71,7 @@ src = ["src", "tests", "benchmarks", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF", "D"]
-ignore = ["D105", "D107", "D203", "D213", "D401", "D413", "N818"]
+ignore = ["D105", "D107", "D203", "D213", "D401", "D413", "N818", "RUF001", "RUF002", "RUF003"]  # unicode × → in prose is intentional
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D"]
