@@ -17,7 +17,7 @@ import datetime as dt
 import logging
 import pickle
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -68,7 +68,7 @@ class SenseAI:
 
     def __init__(
         self,
-        config: str | Path | Config,
+        config: str | Path | Mapping[str, Any] | Config,
         *,
         keyring: Keyring | None = None,
         bridge: BridgeLike | None = None,
@@ -78,8 +78,8 @@ class SenseAI:
         """Build the pipeline from a ``senseai.yaml`` path or a :class:`Config` object.
 
         Args:
-            config: Path to ``senseai.yaml``, or an already-validated ``Config``
-                (``senseai_sdk.config.Config.load(path)``).
+            config: Path to ``senseai.yaml``, the same content as a mapping, or an
+                already-validated ``Config`` (``senseai_sdk.config.Config.load(path)``).
             keyring: Trusted release keys; default: the shipped keys plus
                 ``SENSEAI_RELEASE_KEYS``.
             bridge: A controller bridge to use instead of the one named in ``reflex.bridge``.
@@ -318,8 +318,28 @@ class SenseAI:
         reflex = self._pipeline.reflex
         if not reflex.available:
             raise PipelineError("explain needs senseai-reflex, which is not installed")
-        text: str = reflex.engine.audit.explain(t_ns)
-        return text
+        audit = reflex.engine.audit
+        if audit is None or len(audit) == 0:
+            raise KeyError(f"no reflex audit rows yet (t_ns={t_ns})")
+        try:
+            _, text = audit.explain(t_ns)
+        except LookupError as e:
+            raise KeyError(str(e)) from e
+        return str(text)
+
+    def save_audit(self, path: str | Path) -> None:
+        """Write the reflex audit log (every command with its provenance) to an HDF5 file.
+
+        Read it back with ``senseai logs explain <path> --at T`` or
+        ``senseai_reflex.audit.AuditLog.read_hdf5``.
+
+        Raises:
+            PipelineError: ``senseai-reflex`` is not installed or keeps no audit log.
+        """
+        reflex = self._pipeline.reflex
+        if not reflex.available or reflex.engine.audit is None:
+            raise PipelineError("save_audit needs senseai-reflex with its audit log enabled")
+        reflex.engine.audit.write_hdf5(path)
 
     def save_state(self, path: str | Path) -> None:
         """Checkpoint all stage state to ``path``.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from senseai_sdk.config import Config, TelemetryConfig
 from senseai_sdk.pipeline import Pipeline
@@ -39,7 +40,15 @@ def test_spool_contents_and_upload(config: Config, tmp_path: Path) -> None:
     cfg = TelemetryConfig(enabled=True, raw_frames=False, upload="tests.test_telemetry:upload_ok")
     t = Telemetry(cfg, "e", tmp_path / "spool", sample_every=5, map_every=10, hist_every=20)
     t.attach(p)
-    for _ in range(25):
+    real_world = p.world.step
+
+    def boom(_batch: Any) -> Any:
+        raise RuntimeError("world down for one tick")
+
+    p.world.step = boom  # type: ignore[method-assign, assignment]
+    p.step()  # a degraded first tick is always recorded as a command transition
+    p.world.step = real_world  # type: ignore[method-assign]
+    for _ in range(24):
         p.step()
     spool = tmp_path / "spool"
     files = list(spool.glob("telemetry-*.jsonl"))
@@ -48,8 +57,8 @@ def test_spool_contents_and_upload(config: Config, tmp_path: Path) -> None:
     kinds = [r["kind"] for r in lines]
     assert kinds[0] == "start" and "tick" in kinds
     ticks = [r for r in lines if r["kind"] == "tick"]
-    assert ticks[0]["command"]["action"] == "brake"  # first tick is a transition from "none"
     assert ticks[0]["command"]["degraded"] is True
+    assert any("world down for one tick" in x for x in ticks[0]["command"]["reasons"])
     assert any("per_cell" in r.get("surprise", {}) for r in ticks)
     assert any("latency" in r for r in ticks)
     assert all("raw_samples" not in r for r in ticks)

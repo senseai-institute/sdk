@@ -6,7 +6,13 @@ from typing import Any
 from senseai_sdk.bridges import CallbackBridge, PlannerCommand
 from senseai_sdk.config import Config
 from senseai_sdk.pipeline import Pipeline
+from senseai_sdk.stages import FallbackCommand
 from senseai_sdk.threaded import ThreadedRunner
+
+
+def _starved(c: Any) -> bool:
+    """A command produced without a surprise map: reflex's envelope watchdog or the SDK fallback."""
+    return isinstance(c, FallbackCommand) or bool(c.provenance.degraded)
 
 
 def wait_until(pred: Any, timeout: float) -> bool:
@@ -29,7 +35,9 @@ def test_no_drops_at_100_ticks_per_second(config: Config) -> None:
     drops = r.drops()
     assert drops == {"tokens": 0, "world": 0, "reflex": 0, "cortex": 0}
     assert p.ticks >= 50  # 50 ticks of data; watchdog ticks on the wall clock may add a few
-    with_surprise = [c for c in cmds if c.provenance.reason.startswith("senseai-reflex")]
+    with_surprise = [
+        c for c in cmds if not isinstance(c, FallbackCommand) and c.provenance.surprise_tick_index
+    ]
     assert len(with_surprise) >= 45
     h = p.health()
     assert h.ticks == p.ticks and h.end_to_end_p99_ms > 0
@@ -60,13 +68,15 @@ def test_stalled_world_degrades_to_brake_within_budget(config: Config) -> None:
     stall_from[0] = t0
 
     def starved() -> list[tuple[float, Any]]:
-        return [(t, c) for t, c in cmds if t > t0 and c.provenance.reason == "no SurpriseMap this tick"]
+        return [(t, c) for t, c in cmds if t > t0 and _starved(c)]
 
-    assert wait_until(lambda: len(starved()) >= 3, timeout=3.0)
+    def braking() -> list[tuple[float, Any]]:
+        return [(t, c) for t, c in starved() if c.action == "brake" and c.stop]
+
+    assert wait_until(lambda: len(braking()) >= 3, timeout=3.0)
     r.stop()
-    t_first, first = starved()[0]
-    assert first.action == "brake" and first.stop  # no reflex installed: the watchdog is already at brake
-    assert t_first - t0 < 0.6  # 250 ms watchdog + one stalled world call on this box
+    t_first, _ = braking()[0]
+    assert t_first - t0 < 0.7  # reflex watchdog: slow at 50 ms, brake at 250 ms, + one stalled world call
     assert any(t > t0 and a.linear == 0.0 for t, a in acts)
     assert p.health().state == "degraded"
 

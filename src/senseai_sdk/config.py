@@ -163,8 +163,14 @@ class Config:
         return self.tick_ms * 1_000_000
 
     @classmethod
-    def load(cls, path: str | Path, *, env: Mapping[str, str] | None = None) -> Config:
-        """Read and validate ``path``. Relative paths inside resolve against its directory."""
+    def load(cls, path: str | Path | Mapping[str, Any], *, env: Mapping[str, str] | None = None) -> Config:
+        """Read and validate ``path``. Relative paths inside resolve against its directory.
+
+        A mapping (an already-parsed ``senseai.yaml``) is validated as is; its relative paths
+        resolve against the current directory.
+        """
+        if isinstance(path, Mapping):
+            return cls.from_mapping(path, env=env)
         p = Path(path).expanduser()
         try:
             raw = yaml.safe_load(p.read_text())

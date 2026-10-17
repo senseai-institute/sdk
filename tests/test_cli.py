@@ -29,7 +29,8 @@ def test_doctor_on_fixture(config_path: Path, capsys: pytest.CaptureFixture[str]
     assert rc == 0, out
     assert "[ OK ] config" in out and "[ OK ] licence" in out
     assert "[ OK ] artefact world: world-v0.0 verified" in out
-    assert "[WARN] package senseai_reflex" in out
+    assert "[ OK ] package senseai_reflex: installed" in out
+    assert "[WARN] package senseai_cortex" in out
     assert "[ OK ] tick: 10 ms matches world-v0.0" in out
     assert "[ OK ] sensor dvs0: synthetic (event) produced" in out
     assert "[WARN] calibration dvs0" in out
@@ -82,7 +83,8 @@ def test_run_ticks_and_stats(config_path: Path, capsys: pytest.CaptureFixture[st
     )
     out = capsys.readouterr().out
     assert rc == 0
-    assert "7 commands" in out and '"stages"' in out and "brake" in out and "health at http" in out
+    assert "7 commands" in out and '"stages"' in out and "health at http" in out
+    assert "0.010s none" in out  # the real reflex, not the watchdog's brake
 
 
 def test_run_to_end(config_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -131,7 +133,7 @@ def test_bench(config_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "end-to-end" in out and "sdk" in out and "45 ticks" in out
-    assert "senseai-reflex not installed" in out
+    assert "reflex " in out and "senseai-reflex not installed" not in out
     data = json.loads(out_file.read_text())
     assert data["stages"]["world"]["p99_ms"] > 0 and data["sdk_overhead_p99_ms"] >= 0
     assert main(["bench", "--config", str(config_path), "--max-ticks", "10", "--json"]) == 0
@@ -163,5 +165,5 @@ def test_logs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["logs", "tail", str(f)]) == 0
     assert capsys.readouterr().out.count("text") == 2
     assert main(["logs", "tail", str(tmp_path / "missing.jsonl")]) == 1
-    assert main(["logs", "explain", "--at", "6.21"]) == 3
-    assert "senseai-reflex" in capsys.readouterr().err
+    assert main(["logs", "explain", "--at", "6.21"]) == 1  # events.jsonl is not an audit file
+    assert "not a reflex audit file" in capsys.readouterr().err

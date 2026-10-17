@@ -19,10 +19,11 @@ events. A new engineer can do this in under an hour without reading the other si
 
 **Status: implemented up to the packages that exist.** Config, signed artefacts, licence and
 metering, the single-loop and threaded pipelines, health, telemetry, the CLI, the C API and
-the ROS 2 bundle are built and tested (coverage 86 %, `ruff`, `mypy --strict`). `senseai-reflex`
-and `senseai-cortex` are not started upstream, so today the pipeline runs ingest → tokens →
-profiles → world and the SDK's own watchdog drives the bridge (`brake`) in the degraded state.
-See [Upstream status](#upstream-status).
+the ROS 2 bundle are built and tested (`ruff`, `mypy --strict`). The pipeline runs ingest →
+tokens → profiles → world → reflex; `senseai-cortex` is not started upstream, so no semantic
+events are emitted and health reports `degraded` for that reason alone.
+See [Upstream status](#upstream-status). `examples/replay_dsec.py` runs a DSEC sequence end to end,
+optionally with a world checkpoint you trained (see its docstring).
 
 Apache-2.0, copyright SenseAI Institute. The world-model checkpoint, reflex weights and
 profile priors that the SDK loads are **not** Apache-2.0. They are signed, licensed
@@ -123,9 +124,10 @@ still reachable, but you don't need it.
 | `on_event(cb)` | Calls `cb(Event)` for each cortex event. Events are emitted on change, not every cycle. |
 | `update_context(**ctx)` | Updates scene and motion context: `lux`, `lux_map`, `speed`, `yaw_rate`, `heading`, `speed_cap`, `mode`. Applied before the next tick. |
 | `run()` / `start()` / `stop()` | Run blocking, or start and stop a background thread. |
-| `step()` | Runs exactly one tick in single-loop mode, for sim and tests. Returns a `StepResult`. |
+| `step()` | Runs exactly one tick in single-loop mode, for sim and tests. Returns a `StepResult` (command, events, surprise, per-stage `latency_ns`, `t_sensor_ns` = oldest sample in the tick, `t_emit_ns` = wall clock when the command left the reflex). |
 | `health()` | Per-stage p50/p99, drops, watchdog, licence and artefact state. |
 | `explain(t_ns)` | One-sentence explanation of the reflex command at `t_ns`. |
+| `save_audit(path)` | Writes the reflex audit log (every command and its provenance) to HDF5. |
 | `save_state(path)` / `load_state(path)` | Checkpoints tokenizer, world, reflex and cortex state, so a restart skips the warm-up. |
 
 The full docstrings are in `src/senseai_sdk/api.py`.
@@ -152,8 +154,9 @@ The SDK never silently stops publishing commands. If a stage raises an exception
 past its budget, these things happen:
 
 - `health()` reports `degraded`, naming the stage.
-- The reflex watchdog takes over through the bound bridge: `slow` (speed × 0.5) after 50 ms
-  without a surprise map, then `brake` after 250 ms.
+- The reflex envelope's watchdog takes over through the bound bridge: `slow` after 50 ms
+  without a surprise map, then `brake` after 250 ms (`provenance.degraded` on the command). If
+  the reflex stage itself raises, the SDK's own watchdog applies the same rule.
 - Cortex emits `sensor.degraded`, and later `sensor.restored`.
 
 The `ros2_cmd_vel` bridge stops publishing while unhealthy. Your own safety stack therefore
@@ -207,7 +210,7 @@ subscribed, the modified command is published on `/senseai/cmd_vel` (`Twist`), h
 `/senseai/health` and events on `/senseai/events` (`std_msgs/String` JSON, until
 `senseai-cortex` ships its `Event.msg`). `/senseai/cmd_vel` is published only while the node
 is healthy and ticking; when it is not, nothing is published and your own safety stack
-stays authoritative. When `senseai-reflex` ships its ROS bridge, the node uses that one.
+stays authoritative. The `ros2_cmd_vel` bridge is reflex's `CmdVelBridge`.
 
 ---
 
@@ -268,7 +271,7 @@ return JSON with these fields:
 | `senseai calibrate [--yes] [--sensor ID] [--imu-rest rest.csv]` | Guided per-sensor files in `calib/`: cameras from field of view (or a checkerboard with OpenCV installed), mic arrays from a named geometry, IMUs from a recording at rest. |
 | `senseai licence show\|activate\|report` | Inspect, install or export licence usage. |
 | `senseai profiles list\|show` | Profiles the licence allows, with versions and audit report. |
-| `senseai logs tail <events.jsonl> [-f]` / `logs explain --at T` | Follow an events or telemetry file; explain the reflex command at time T (needs `senseai-reflex`). |
+| `senseai logs tail <events.jsonl> [-f]` / `logs explain <commands.h5> --at T` | Follow an events or telemetry file; explain the reflex command T seconds into an audit file written by `SenseAI.save_audit` (or `senseai-reflex run --out`). |
 
 ## Latency budget
 
@@ -336,7 +339,7 @@ The SDK composes these packages through their public contracts only:
 | `senseai-tokens` | `Tokenizer`, `TokenBatch` | Gate 1 complete on CPU. |
 | `senseai-profiles` | `Registry`, `Profile` | Gate 1; `panther.v0` and `null.v0` bundles. |
 | `senseai-world` | `WorldModel`, `SurpriseMap`, `WorldState` | Implemented; CPU `step()` p99 77–112 ms (over budget), CUDA not yet measured. |
-| `senseai-reflex` | `ReflexEngine`, `ReflexCommand`, `ControllerBridge`, hooks | **Not started** (empty repository). The SDK's `ReflexStage` imports it lazily; until then the SDK watchdog (`slow` at 50 ms, `brake` at 250 ms without a surprise map) drives the bridge, health is `degraded` and `bench` labels the row. |
+| `senseai-reflex` | `ReflexEngine`, `ReflexCommand`, `ControllerBridge`, `AuditLog` | Implemented (pinned at fa42fa3). `ReflexStage` builds the engine from the reflex artefact's `reflex.yaml` (`ReflexConfig.from_dict`), feeds it `RobotState` with `t_sensor_ns` (oldest sample in the tick), installs the profile's `ReflexPrior` with its name and version, and hands out a snapshot of each command. `ros2_cmd_vel` uses reflex's `CmdVelBridge`. |
 | `senseai-cortex` | `CortexEngine`, `Event`, sinks | **Not started** (empty repository). No events are emitted; `on_event` callbacks and sinks are wired and idle. |
 
 Decisions taken for the SDK (2026-10-17): the reflex's 0–10 surprise scale is the commit

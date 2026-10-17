@@ -25,7 +25,7 @@ import time
 from collections import deque
 from typing import Any
 
-from senseai_sdk.pipeline import Pipeline, StepResult
+from senseai_sdk.pipeline import Pipeline, StepResult, oldest_sample_ns
 
 __all__ = ["ThreadedRunner"]
 
@@ -228,7 +228,8 @@ class ThreadedRunner:
                     tick = batch = surprise = world_state = None
                     reasons = ["no SurpriseMap within the tick"]
                     t_ns = time.time_ns()
-                cmd, actuator = p.reflex_path(surprise, t_ns, lat, reasons)
+                t_sensor = oldest_sample_ns(tick) if tick is not None else None
+                cmd, actuator, t_emit = p.reflex_path(surprise, t_ns, lat, reasons, t_sensor_ns=t_sensor)
                 res = StepResult(
                     tick_index=int(tick.index) if tick is not None else -1,
                     t_master_ns=t_ns,
@@ -239,6 +240,8 @@ class ThreadedRunner:
                     actuator=actuator,
                     reasons=reasons,
                     tick=tick if p.keep_ticks else None,
+                    t_sensor_ns=t_sensor,
+                    t_emit_ns=t_emit,
                 )
                 p.finish_tick(res, t_start)
                 self.results.append(res)
