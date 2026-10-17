@@ -120,7 +120,10 @@ def run_checks(
             yield Check("artefact profile", "fail", str(e), "pin profile.version to a bundle in the store")
 
     # 4. runtime packages
-    for pkg, role in (("senseai_reflex", "reflex commands"), ("senseai_cortex", "semantic events")):
+    for pkg, effect in (
+        ("senseai_reflex", "no reflex commands; the watchdog drives the bridge"),
+        ("senseai_cortex", "no semantic events"),
+    ):
         try:
             importlib.import_module(pkg)
             yield Check(f"package {pkg}", "ok", "installed")
@@ -128,7 +131,7 @@ def run_checks(
             yield Check(
                 f"package {pkg}",
                 "warn",
-                f"not installed: no {role}; the watchdog drives the bridge",
+                f"not installed: {effect}",
                 f"pip install {pkg.replace('_', '-')} when it ships",
             )
 

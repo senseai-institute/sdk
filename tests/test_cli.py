@@ -86,8 +86,12 @@ def test_run_ticks_and_stats(config_path: Path, capsys: pytest.CaptureFixture[st
 
 
 def test_run_to_end(config_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """``run`` is threaded mode: 50 ticks of data plus a few wall-clock watchdog ticks."""
+    import re
+
     assert main(["run", "--config", str(config_path)]) == 0
-    assert "50 commands" in capsys.readouterr().out
+    m = re.search(r"(\d+) commands", capsys.readouterr().out)
+    assert m and int(m.group(1)) >= 50
 
 
 def test_licence_show_activate_report(
