@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import shutil
 from collections.abc import Iterator
@@ -92,6 +93,20 @@ def store(tmp_path_factory: pytest.TempPathFactory, release_key: Ed25519PrivateK
     return root
 
 
+@pytest.fixture(scope="session")
+def licence_key(release_key: Ed25519PrivateKey) -> str:
+    """A licence for the test endpoint, all profiles and senses, valid for a year from 2026-10-17."""
+    from senseai_sdk.licence import issue_licence
+
+    return issue_licence(
+        release_key,
+        licence_id="TEST-LICENCE",
+        endpoint_class="amr",
+        issued=dt.date(2026, 10, 17),
+        expires=dt.date(2027, 10, 17),
+    )
+
+
 @pytest.fixture
 def keyring(release_key: Ed25519PrivateKey) -> Keyring:
     return Keyring.from_private(release_key)
@@ -139,12 +154,14 @@ def base_config(store: Path, cache: Path, **over: Any) -> dict[str, Any]:
 
 
 @pytest.fixture
-def config(store: Path, tmp_path: Path, trust_release_key: None) -> Config:
-    return Config.from_mapping(base_config(store, tmp_path / "cache"), env={}, base=tmp_path)
+def config(store: Path, tmp_path: Path, trust_release_key: None, licence_key: str) -> Config:
+    return Config.from_mapping(
+        base_config(store, tmp_path / "cache", licence_key=licence_key), env={}, base=tmp_path
+    )
 
 
 @pytest.fixture
-def config_path(store: Path, tmp_path: Path, trust_release_key: None) -> Iterator[Path]:
+def config_path(store: Path, tmp_path: Path, trust_release_key: None, licence_key: str) -> Iterator[Path]:
     p = tmp_path / "senseai.yaml"
-    p.write_text(yaml.safe_dump(base_config(store, tmp_path / "cache")))
+    p.write_text(yaml.safe_dump(base_config(store, tmp_path / "cache", licence_key=licence_key)))
     yield p
