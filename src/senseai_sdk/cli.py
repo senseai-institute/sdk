@@ -190,6 +190,32 @@ def _bench(a: argparse.Namespace) -> int:
     return 0
 
 
+def _calibrate(a: argparse.Namespace) -> int:
+    from senseai_sdk import calibration as cal
+    from senseai_sdk.config import Config
+
+    cfg = Config.load(a.config)
+    out = Path(a.out)
+    if a.imu_rest:
+        import numpy as np
+
+        samples = np.loadtxt(a.imu_rest, delimiter=",")
+        entry = cal.imu_at_rest(samples)
+        p = cal.write_calibration(out / f"{a.sensor}.yaml", a.sensor, entry)
+        print(f"wrote {p} from {len(samples)} rest samples")
+        return 0
+
+    def ask(prompt: str, default: str) -> str:
+        if a.yes:
+            return default
+        ans = input(f"{prompt} [{default}]: ").strip()
+        return ans or default
+
+    files = cal.guided(cfg, out, ask=ask, only=a.sensor)
+    print(f"{len(files)} calibration files in {out}; run `senseai doctor` to confirm they are picked up")
+    return 0
+
+
 def _not_yet(what: str) -> int:
     print(f"senseai {what}: not implemented in this build", file=sys.stderr)
     return 3
@@ -248,7 +274,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=None)
     p.set_defaults(fn=_bench)
 
-    for name in ("calibrate", "logs"):
+    p = sub.add_parser("calibrate", help="guided per-sensor calibration files")
+    p.add_argument("--config", default="senseai.yaml")
+    p.add_argument("--out", default="calib")
+    p.add_argument("--sensor", default=None, help="only this sensor id")
+    p.add_argument("--yes", action="store_true", help="accept every default (non-interactive)")
+    p.add_argument(
+        "--imu-rest", default=None, help="CSV of ax,ay,az,gx,gy,gz rows recorded at rest (with --sensor)"
+    )
+    p.set_defaults(fn=_calibrate)
+
+    for name in ("logs",):
         p = sub.add_parser(name)
         p.add_argument("rest", nargs="*")
         p.set_defaults(fn=lambda a, n=name: _not_yet(n))

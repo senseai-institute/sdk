@@ -46,6 +46,7 @@ dev = [
 
 [project.scripts]
 senseai = "senseai_sdk.cli:main"
+senseai-ros2 = "senseai_sdk.ros2.nodes:main"
 
 [project.urls]
 Homepage = "https://github.com/senseai-institute/sdk"
@@ -87,6 +88,7 @@ mypy_path = "src"
 
 [[tool.mypy.overrides]]
 module = ["h5py", "h5py.*", "rclpy", "rclpy.*", "launch", "launch.*", "launch_ros", "launch_ros.*",
+          "geometry_msgs.*", "std_msgs.*", "cv2", "cv2.*",
           "senseai_reflex", "senseai_reflex.*", "senseai_cortex", "senseai_cortex.*",
           "senseai_tokens.*", "senseai_world.*", "senseai_profiles.*", "senseai_ingest.*"]
 ignore_missing_imports = true
@@ -99,7 +101,7 @@ markers = ["slow: longer end-to-end tests"]
 [tool.coverage.run]
 source = ["senseai_sdk"]
 branch = true
-omit = ["*/ros2/*", "*/capi/shim.py"]
+omit = ["*/ros2/launch/*"]
 
 [tool.coverage.report]
 exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@abstractmethod", "\\.\\.\\."]
