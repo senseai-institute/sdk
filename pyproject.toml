@@ -29,8 +29,8 @@ dependencies = [
   "senseai-ingest @ git+https://github.com/senseai-institute/ingest@087b98408f4bcfd83f26ebb66dc4ed616441e341",
   "senseai-tokens @ git+https://github.com/senseai-institute/tokens@7b12b1e",
   "senseai-profiles @ git+https://github.com/senseai-institute/profiles@9ef8e20#subdirectory=packages/senseai-profiles",
-  "senseai-world @ git+https://github.com/senseai-institute/world@06c510e80f33de1c7a0dcd8069442b1809bc04db",
-  "senseai-reflex @ git+https://github.com/senseai-institute/reflex@fa42fa32412a832e93a8039aadd03e119bce4476",
+  "senseai-world @ git+https://github.com/senseai-institute/world@0a25692db8bd5df77039e2e4ed0998b59c079e1c",
+  "senseai-reflex @ git+https://github.com/senseai-institute/reflex@9442c535a3122161a6be22fc51682d22d46e6ba8",
 ]
 
 [project.optional-dependencies]

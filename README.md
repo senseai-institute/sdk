@@ -339,7 +339,7 @@ The SDK composes these packages through their public contracts only:
 | `senseai-tokens` | `Tokenizer`, `TokenBatch` | Gate 1 complete on CPU. |
 | `senseai-profiles` | `Registry`, `Profile` | Gate 1; `panther.v0` and `null.v0` bundles. |
 | `senseai-world` | `WorldModel`, `SurpriseMap`, `WorldState` | Implemented; CPU `step()` p99 77–112 ms (over budget), CUDA not yet measured. |
-| `senseai-reflex` | `ReflexEngine`, `ReflexCommand`, `ControllerBridge`, `AuditLog` | Implemented (pinned at fa42fa3). `ReflexStage` builds the engine from the reflex artefact's `reflex.yaml` (`ReflexConfig.from_dict`), feeds it `RobotState` with `t_sensor_ns` (oldest sample in the tick), installs the profile's `ReflexPrior` with its name and version, and hands out a snapshot of each command. `ros2_cmd_vel` uses reflex's `CmdVelBridge`. |
+| `senseai-reflex` | `ReflexEngine`, `ReflexCommand`, `ControllerBridge`, `AuditLog` | Implemented (pinned at 9442c53; needs world 0a25692 or later for `SurpriseMap.has_bin_stats`). `ReflexStage` builds the engine from the reflex artefact's `reflex.yaml` (`ReflexConfig.from_dict`), feeds it `RobotState` with `t_sensor_ns` (oldest sample in the tick), installs the profile's `ReflexPrior` with its name and version, and hands out a snapshot of each command. `ros2_cmd_vel` uses reflex's `CmdVelBridge`. |
 | `senseai-cortex` | `CortexEngine`, `Event`, sinks | **Not started** (empty repository). No events are emitted; `on_event` callbacks and sinks are wired and idle. |
 
 Decisions taken for the SDK (2026-10-17): the reflex's 0–10 surprise scale is the commit
