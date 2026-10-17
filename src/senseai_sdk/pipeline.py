@@ -61,6 +61,7 @@ class StepResult:
     degraded: bool = False
     actuator: PlannerCommand | None = None
     reasons: list[str] = field(default_factory=list)
+    tick: Any | None = None  # the AlignedTick, only when Pipeline.keep_ticks (telemetry raw_frames)
 
 
 class Pipeline:
@@ -106,7 +107,8 @@ class Pipeline:
         self._stopped = False
         self._last_reasons: list[str] = []
         self._world_ok_ticks = 0
-        self.on_tick: Callable[[StepResult], None] | None = None  # telemetry / audit tap
+        self.keep_ticks = False
+        self.taps: list[Callable[[StepResult], None]] = []  # telemetry, metering, audit
 
     # -- construction -----------------------------------------------------------------------
 
@@ -267,11 +269,14 @@ class Pipeline:
 
     # -- lifecycle ----------------------------------------------------------------------------
 
-    def open(self) -> None:
-        """Open devices and register their specs with the tokenizer."""
+    def open(self, *, paced: bool = False) -> None:
+        """Open devices and register their specs with the tokenizer.
+
+        ``paced`` replays recordings at real time (threaded mode); otherwise as fast as possible.
+        """
         if self._opened:
             return
-        self.ingest.open()
+        self.ingest.open(paced=paced)
         self.tokens.set_specs(self.ingest.specs())
         self._opened = True
 
@@ -293,6 +298,10 @@ class Pipeline:
 
     # -- the tick ----------------------------------------------------------------------------
 
+    def _lat(self, stats: StageStats) -> int:
+        """The most recent latency sample of a stage, in ns."""
+        return int(stats.latency._buf[(stats.latency._i - 1) % len(stats.latency._buf)])
+
     def step(self) -> StepResult:
         """One tick through every stage. Raises ``StopIteration`` at the end of a replay."""
         if not self._opened:
@@ -303,12 +312,12 @@ class Pipeline:
         lat: dict[str, int] = {}
 
         tick = self.ingest.step()  # StopIteration propagates: end of replay
-        lat["ingest"] = self.ingest.stats.latency._buf[(self.ingest.stats.latency._i - 1) % 1000]
+        lat["ingest"] = self._lat(self.ingest.stats)
         t_ns = int(tick.t_master_ns)
 
         batch = self._guard(self.tokens.stats, lambda: self.tokens.step(tick), reasons, "tokens")
         if batch is not None:
-            lat["tokens"] = self.tokens.stats.latency._buf[(self.tokens.stats.latency._i - 1) % 1000]
+            lat["tokens"] = self._lat(self.tokens.stats)
             self._guard(
                 self.profiles.stats,
                 lambda: self.profiles.per_tick(self.tokens.tokenizer, batch),
@@ -321,11 +330,11 @@ class Pipeline:
             out = self._guard(self.world.stats, lambda: self.world.step(batch), reasons, "world")
             if out is not None:
                 surprise, world_state = out
-                lat["world"] = self.world.stats.latency._buf[(self.world.stats.latency._i - 1) % 1000]
+                lat["world"] = self._lat(self.world.stats)
 
         cmd = self.reflex.step(surprise, self.motion, t_ns, self.profiles.active_ref)
         if self.reflex.available:
-            lat["reflex"] = self.reflex.stats.latency._buf[(self.reflex.stats.latency._i - 1) % 1000]
+            lat["reflex"] = self._lat(self.reflex.stats)
         if getattr(cmd, "degraded", False):
             reasons.append(cmd.provenance.reason)
 
@@ -343,7 +352,7 @@ class Pipeline:
 
         events = self.cortex.step(tick.index, world_state, surprise, cmd, batch)
         if self.cortex.available:
-            lat["cortex"] = self.cortex.stats.latency._buf[(self.cortex.stats.latency._i - 1) % 1000]
+            lat["cortex"] = self._lat(self.cortex.stats)
         for ev in events:
             for ecb in self._event_cbs:
                 try:
@@ -351,17 +360,6 @@ class Pipeline:
                 except Exception as e:
                     self.sdk_stats.fail(e)
 
-        total = time.perf_counter_ns() - t_start
-        lat["total"] = total
-        lat["sdk"] = max(0, total - sum(v for k, v in lat.items() if k not in ("total", "sdk")))
-        self.sdk_stats.record(lat["sdk"])
-        self.total.add(total)
-        if not self.ingest.live:
-            self.e2e.add(total)  # replay: sensor time is not wall time, so the loop is the e2e
-        else:
-            self.e2e.add(max(0, time.time_ns() - t_ns))
-        self.ticks += 1
-        self._last_reasons = reasons
         res = StepResult(
             tick_index=int(tick.index),
             t_master_ns=t_ns,
@@ -369,13 +367,67 @@ class Pipeline:
             events=events,
             surprise=surprise,
             latency_ns=lat,
-            degraded=bool(reasons),
             actuator=actuator if isinstance(actuator, PlannerCommand) else None,
             reasons=reasons,
+            tick=tick if self.keep_ticks else None,
         )
-        if self.on_tick is not None:
-            self.on_tick(res)
+        self.finish_tick(res, t_start)
         return res
+
+    def reflex_path(
+        self, surprise: Any | None, t_ns: int, lat: dict[str, int], reasons: list[str]
+    ) -> tuple[Any, Any]:
+        """Reflex → bridge → command callbacks. Always produces a command and calls the bridge."""
+        cmd = self.reflex.step(surprise, self.motion, t_ns, self.profiles.active_ref)
+        if self.reflex.available:
+            lat["reflex"] = self._lat(self.reflex.stats)
+        if getattr(cmd, "degraded", False):
+            reasons.append(cmd.provenance.reason)
+        t_b = time.perf_counter_ns()
+        planner = self.bridge.planner_cmd() if hasattr(self.bridge, "planner_cmd") else PlannerCommand()
+        actuator = self._guard(self.sdk_stats, lambda: self.bridge.apply(cmd, planner), reasons, "bridge")
+        lat["bridge"] = time.perf_counter_ns() - t_b
+        for cb in self._cmd_cbs:
+            try:
+                cb(cmd)
+            except Exception as e:  # a customer callback never stops the pipeline
+                self.sdk_stats.fail(e)
+                reasons.append(f"on_command callback raised {type(e).__name__}")
+        return cmd, actuator
+
+    def cortex_path(
+        self, tick_index: int, world_state: Any, surprise: Any, cmd: Any, batch: Any, lat: dict[str, int]
+    ) -> list[Any]:
+        """Cortex → event callbacks."""
+        events = self.cortex.step(tick_index, world_state, surprise, cmd, batch)
+        if self.cortex.available:
+            lat["cortex"] = self._lat(self.cortex.stats)
+        for ev in events:
+            for ecb in self._event_cbs:
+                try:
+                    ecb(ev)
+                except Exception as e:
+                    self.sdk_stats.fail(e)
+        return events
+
+    def finish_tick(self, res: StepResult, t_start: int) -> None:
+        """Record totals, bump counters and run the taps. Shared by both runners."""
+        lat = dict(res.latency_ns)
+        total = time.perf_counter_ns() - t_start
+        lat["total"] = total
+        lat["sdk"] = max(0, total - sum(v for k, v in lat.items() if k not in ("total", "sdk")))
+        res.latency_ns = lat
+        self.sdk_stats.record(lat["sdk"])
+        self.total.add(total)
+        if self.ingest.live or self.ingest.paced:
+            self.e2e.add(max(0, time.time_ns() - self.ingest.wall_ns(res.t_master_ns)))
+        else:
+            self.e2e.add(total)  # unpaced replay: sensor time is not wall time, so the loop is the e2e
+        self.ticks += 1
+        self._last_reasons = res.reasons
+        res.degraded = bool(res.reasons)
+        for tap in self.taps:
+            tap(res)
 
     @staticmethod
     def _guard(stats: StageStats, fn: Callable[[], Any], reasons: list[str], name: str) -> Any:

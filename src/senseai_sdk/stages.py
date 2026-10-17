@@ -109,19 +109,28 @@ def _timed(stats: StageStats, fn: Callable[[], Any]) -> Any:
 
 
 class IngestStage:
-    """Builds the configured adapters and the ``Aligner``; yields one ``AlignedTick`` per step."""
+    """Builds the configured adapters and the ``Aligner``; yields one ``AlignedTick`` per step.
+
+    With ``tick_file`` it reads an ingest ``ticks.h5`` instead (``senseai bench --ticks``).
+    """
 
     name = "ingest"
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, tick_file: Path | None = None) -> None:
         self.cfg = cfg
         self.stats = StageStats(self.name)
         self._adapters: dict[str, Any] = {}
         self._aligner: Any = None
+        self._reader: Any = None
         self._iter: Iterator[Any] | None = None
         self.live = False
-        for s in cfg.sensors:
-            self._adapters[s.id] = self._build(s)
+        self.paced = False
+        self._t0_wall_ns = 0
+        self._t0_master_ns: int | None = None
+        self.tick_file = tick_file
+        if tick_file is None:
+            for s in cfg.sensors:
+                self._adapters[s.id] = self._build(s)
 
     @staticmethod
     def _build(s: SensorConfig) -> Any:
@@ -139,23 +148,55 @@ class IngestStage:
         if self._aligner is not None:
             self.close()
 
-    def open(self) -> None:
-        """Open every adapter and start the aligner."""
+    def open(self, *, paced: bool = False) -> None:
+        """Open every adapter and start the aligner (or the tick-file reader)."""
+        self.paced = paced
+        self._t0_wall_ns = time.time_ns()
+        self._t0_master_ns = None
+        if self.tick_file is not None:
+            from senseai_ingest.writer import TickReader
+
+            self._reader = TickReader(self.tick_file)
+            if int(self._reader.tick_ns) != self.cfg.tick_ns:
+                file_ms = int(self._reader.tick_ns) // 1_000_000
+                raise PipelineError(f"{self.tick_file}: tick {file_ms} ms, config {self.cfg.tick_ms} ms")
+            self._iter = self._paced(iter(self._reader)) if paced else iter(self._reader)
+            return
         from senseai_ingest.sync import Aligner, AlignerConfig
 
         ads = list(self._adapters.values())
         self.live = any(getattr(a, "is_live", False) for a in ads)
-        speed = None if self.live else 0.0
+        speed = None if self.live else (1.0 if paced else 0.0)
         self._aligner = Aligner(ads, AlignerConfig(tick_ns=self.cfg.tick_ns, speed=speed))
         self._aligner.open()
         self._iter = iter(self._aligner)
 
+    def _paced(self, it: Iterator[Any]) -> Iterator[Any]:
+        """Replay a tick file at real time."""
+        t0: int | None = None
+        wall0 = time.perf_counter_ns()
+        for tick in it:
+            if t0 is None:
+                t0 = int(tick.t_master_ns)
+            due = wall0 + (int(tick.t_master_ns) - t0)
+            while time.perf_counter_ns() < due:
+                time.sleep(min(0.001, (due - time.perf_counter_ns()) / 1e9))
+            yield tick
+
+    def wall_ns(self, t_master_ns: int) -> int:
+        """Map a master-clock time onto the wall clock (identity for live sources)."""
+        if self.live:
+            return t_master_ns
+        if self._t0_master_ns is None:
+            self._t0_master_ns = t_master_ns
+        return self._t0_wall_ns + (t_master_ns - self._t0_master_ns)
+
     def specs(self) -> dict[str, Any]:
         """Source specs, available after :meth:`open`."""
-        if self._aligner is None:
+        if self._aligner is None and self._reader is None:
             self.open()
-        assert self._aligner is not None
-        return dict(self._aligner.specs())
+        src = self._reader if self._reader is not None else self._aligner
+        return dict(src.specs())
 
     def step(self) -> Any:
         """The next ``AlignedTick``. Raises ``StopIteration`` at the end of a replay."""
@@ -172,7 +213,9 @@ class IngestStage:
         """Close adapters."""
         if self._aligner is not None:
             self._aligner.close()
-        self._aligner = None
+        if self._reader is not None:
+            self._reader.close()
+        self._aligner = self._reader = None
         self._iter = None
 
 
@@ -397,7 +440,7 @@ class ReflexStage:
         else:
             action, scale, stop = "none", 1.0, False
         if no_surprise:
-            reason = "no SurpriseMap this tick (world stage failed)"
+            reason = "no SurpriseMap this tick"
         elif not self.available:
             reason = self.stats.reason or "reflex unavailable"
         else:

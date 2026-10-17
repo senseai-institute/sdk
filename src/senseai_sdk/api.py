@@ -113,7 +113,7 @@ class SenseAI:
             licence_state=lambda: self.licence.state(self._today),
             device=device,
         )
-        self._pipeline.on_tick = self._meter_tick
+        self._pipeline.taps.append(self._meter_tick)
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._senses_checked = False
