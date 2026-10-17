@@ -136,7 +136,7 @@ def _licence(a: argparse.Namespace) -> int:
 
 
 def _profiles(a: argparse.Namespace) -> int:
-    from senseai_sdk.artefacts import ArtefactStore, Keyring
+    from senseai_sdk.artefacts import ArtefactStore, Keyring, profile_artefact_id
     from senseai_sdk.config import Config
     from senseai_sdk.licence import Licence
 
@@ -160,11 +160,12 @@ def _profiles(a: argparse.Namespace) -> int:
             print(f"{name:<12} {vs:<12} {'yes' if lic.allows_profile(name) else 'no'}")
         return 0
     name = a.name
-    if name not in found:
+    key = name.replace("_", "-")  # artefact ids spell "_" as "-"
+    if key not in found:
         print(f"no profile {name!r} in {root}; have {sorted(found)}", file=sys.stderr)
         return 1
-    v: int = a.version if a.version is not None else max(found[name])
-    art = store.fetch(f"profile-{name}-v{v}")
+    v: int = a.version if a.version is not None else max(found[key])
+    art = store.fetch(profile_artefact_id(name, v))
     report = art.root / "priors" / f"{name}.v{v}.md"
     print(f"{art.id}: {len(art.files)} files, verified")
     if report.is_file():
@@ -216,14 +217,34 @@ def _calibrate(a: argparse.Namespace) -> int:
     return 0
 
 
-def _logs(a: argparse.Namespace) -> int:
-    """``logs tail <file>`` follows a cortex/telemetry JSONL file; ``logs explain --at T`` needs reflex."""
-    if a.action == "explain":
-        print(
-            "senseai logs explain: the reflex audit log lives in senseai-reflex, which is not installed yet",
-            file=sys.stderr,
-        )
+def _explain(path: Path, at_s: float | None) -> int:
+    try:
+        from senseai_reflex.audit import AuditLog
+    except ImportError:
+        print("senseai logs explain: needs senseai-reflex, which is not installed", file=sys.stderr)
         return 3
+    if path.suffix not in (".h5", ".hdf5") or not path.is_file():
+        print(f"{path}: not a reflex audit file (commands.h5)", file=sys.stderr)
+        return 1
+    log = AuditLog.read_hdf5(path)
+    t_ns = log.t0_ns() + int((at_s or 0.0) * 1e9)
+    try:
+        _, text = log.explain(t_ns)
+    except LookupError as e:
+        print(f"{path}: {e}", file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+
+
+def _logs(a: argparse.Namespace) -> int:
+    """``logs tail <file>`` follows a cortex/telemetry JSONL file.
+
+    ``logs explain <commands.h5> --at T`` explains the reflex command in force ``T`` seconds into a
+    reflex audit file (written by ``SenseAI.save_audit`` or ``senseai-reflex run --out``).
+    """
+    if a.action == "explain":
+        return _explain(Path(a.file), a.at)
     path = Path(a.file)
     if not path.is_file():
         print(f"{path}: no such file", file=sys.stderr)
@@ -305,7 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(fn=_calibrate)
 
-    p = sub.add_parser("logs", help="tail <events.jsonl> | explain --at T")
+    p = sub.add_parser("logs", help="tail <events.jsonl> | explain <commands.h5> --at T")
     p.add_argument("action", choices=["tail", "explain"])
     p.add_argument("file", nargs="?", default="events.jsonl")
     p.add_argument("--at", type=float, default=None)

@@ -168,8 +168,16 @@ def build(name: str, source_id: str, options: Mapping[str, Any]) -> Adapter:
         if entry.config_cls is not None:
             cfg = getattr(mod, entry.config_cls)(source_id=source_id, **options)
             adapter: Adapter = cls(cfg)
+        elif hasattr(cls, "from_sequence"):
+            # recording factories (DSEC, M3ED, MVSEC) open every source of a sequence; take ours
+            opts = dict(options)
+            path = opts.pop("path")
+            found = cls.from_sequence(path, sources=[source_id], **opts)
+            if len(found) != 1:
+                raise TypeError(f"expected one source {source_id!r} in {path}, found {len(found)}")
+            adapter = found[0]
         else:
             adapter = cls(source_id=source_id, **options)
-    except TypeError as e:
+    except (TypeError, KeyError) as e:
         raise TypeError(f"adapter {name!r} for {source_id!r}: {e}") from e
     return adapter

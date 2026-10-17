@@ -46,7 +46,7 @@ def test_build_verifies_artefacts(config: Config) -> None:
     assert p.artefacts["world"].id == "world-v0.0"
     assert p.artefacts["reflex"].id == "reflex-v0.0"
     assert p.world.tokenizer_id == p.tokens.tokenizer_id
-    assert p.reflex.available is False  # senseai-reflex is not built yet
+    assert p.reflex.available is True  # senseai-reflex is a dependency
     assert p.cortex.available is False
 
 
@@ -67,13 +67,16 @@ def test_replay_runs_to_end_and_commands_every_tick(config: Config) -> None:
     assert len(seen) == 50 and len(actuated) == 51  # + the final hold
     assert all(r.surprise is not None for r in results)
     assert all(r.surprise is not None and r.surprise.per_cell.shape == (32, 32) for r in results)
-    # without reflex, the watchdog's brake drives the bridge and health says why
-    assert all(isinstance(r.command, FallbackCommand) for r in results)
-    assert all(r.command.action == "brake" and r.command.stop for r in results)
-    assert all(a.linear == 0.0 for a in actuated)
+    # the real reflex decides every tick; no SDK watchdog fallback on a healthy replay
+    assert not any(isinstance(r.command, FallbackCommand) for r in results)
+    assert all(not r.command.provenance.degraded for r in results)
+    assert [r.command.seq for r in results] == list(range(1, 51))  # snapshots, not one reused object
+    assert all(r.t_sensor_ns is not None and r.t_sensor_ns <= r.t_master_ns for r in results)
+    assert all(r.command.provenance.latency.pipeline_ns > 0 for r in results)
+    assert all(r.t_emit_ns > 0 for r in results)
     h = p.health()
-    assert h.state == "degraded"
-    assert any("senseai-reflex not installed" in r for r in h.reasons)
+    # degraded only because senseai-cortex is not built yet; nothing about reflex
+    assert all("cortex" in x for x in h.reasons), h.reasons
     assert h.ticks == 50
     assert [s.name for s in h.stages] == ["ingest", "tokens", "world", "reflex", "cortex", "sdk"]
     assert h.stages[2].p99_ms > 0
@@ -132,11 +135,16 @@ def test_stage_failure_degrades_and_watchdog_brakes(config: Config) -> None:
     r = p.step()
     assert r.degraded and r.surprise is None
     assert any("world stage failed: RuntimeError: world exploded" in x for x in r.reasons)
-    assert r.command.action == "brake" and r.command.stop
     h = p.health()
     assert h.state == "degraded"
     assert h.stages[2].errors == 1 and "world exploded" in (h.stages[2].last_error or "")
-    assert results[0].command.action == "brake"
+    # reflex's envelope watchdog takes over: slow after 50 ms without a map, brake after 250 ms
+    later = [p.step() for _ in range(30)]
+    assert any(x.command.provenance.degraded and x.command.action == "slow" for x in later)
+    assert later[-1].command.action == "brake" and later[-1].command.stop
+    assert later[-1].command.provenance.degraded
+    assert not any(isinstance(x.command, FallbackCommand) for x in later)  # reflex itself did not fail
+    assert all(not x.command.provenance.degraded for x in results)
     p.close()
 
 
@@ -233,3 +241,29 @@ def test_close_is_idempotent_and_publishes_hold(config: Config) -> None:
     p.close()
     p.close()
     assert actuated[-1] == PlannerCommand(0.0, 0.0)
+
+
+def test_dsec_replay_end_to_end_with_profiles(
+    tmp_path: Path, release_key: Any, licence_key: str, trust_release_key: None
+) -> None:
+    """A DSEC sequence directory through every stage, for each shipped profile."""
+    pytest.importorskip("PIL")
+    from senseai_ingest.testing import make_dsec_fixture
+
+    from senseai_sdk.testing import build_fixture_store
+
+    seq = make_dsec_fixture(tmp_path / "seq", duration_s=0.3, events_per_s=50_000)
+    store = build_fixture_store(tmp_path / "store", release_key, sources=["events_left", "rgb_left"])
+    for name in ("null", "panther"):
+        d = base_config(store, tmp_path / f"cache-{name}", licence_key=licence_key)
+        d["profile"] = {"name": name}
+        d["sensors"] = [
+            {"id": "events_left", "adapter": "dsec", "path": str(seq), "spec": "generic_event_camera"},
+            {"id": "rgb_left", "adapter": "dsec", "path": str(seq), "spec": "generic_rgb_camera"},
+        ]
+        p = Pipeline.from_config(Config.from_mapping(d, env={}, base=tmp_path))
+        results = run_all(p)
+        assert len(results) >= 25
+        assert not any(isinstance(r.command, FallbackCommand) for r in results)
+        assert {r.command.provenance.profile_name for r in results} == {name}
+        assert all(r.surprise is not None for r in results)

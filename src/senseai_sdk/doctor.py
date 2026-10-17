@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from senseai_sdk import adapters as adapter_table
-from senseai_sdk.artefacts import ArtefactStore, Keyring
+from senseai_sdk.artefacts import ArtefactStore, Keyring, profile_artefact_id, profile_artefact_prefix
 from senseai_sdk.config import Config
 from senseai_sdk.errors import SenseAIError
 from senseai_sdk.licence import Licence
@@ -108,12 +108,13 @@ def run_checks(
         try:
             if v is None:
                 root = Path(str(cfg.artefacts.store)).expanduser()
-                found = sorted(root.glob(f"profile-{cfg.profile.name}-v*"))
+                prefix = profile_artefact_prefix(cfg.profile.name)
+                found = sorted(root.glob(f"{prefix}*"))
                 if not found:
-                    raise SenseAIError(f"no profile-{cfg.profile.name}-v* in {root}")
+                    raise SenseAIError(f"no {prefix}* in {root}")
                 aid = found[-1].name
             else:
-                aid = f"profile-{cfg.profile.name}-v{v}"
+                aid = profile_artefact_id(cfg.profile.name, v)
             store.fetch(aid)
             yield Check("artefact profile", "ok", f"{aid} verified")
         except SenseAIError as e:
@@ -132,7 +133,7 @@ def run_checks(
                 f"package {pkg}",
                 "warn",
                 f"not installed: {effect}",
-                f"pip install {pkg.replace('_', '-')} when it ships",
+                f"pip install {pkg.replace('_', '-')}",
             )
 
     # 5. tick vs world artefact

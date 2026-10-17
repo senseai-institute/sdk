@@ -15,6 +15,7 @@ argument mapping change.
 from __future__ import annotations
 
 import contextlib
+import pickle
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -309,7 +310,9 @@ class ProfilesStage:
         with contextlib.suppress(SceneError):  # resolved on the first tick that carries the lux map
             profile.apply(tokenizer, self._pending_scene or None)
         if reflex is not None and getattr(reflex, "available", False):
-            profile.apply(reflex.engine)
+            reflex.set_profile(
+                profile
+            )  # not profile.apply(): that routes engines with set_profile to the tokenizer path
 
     def update_context(self, **scene: Any) -> None:
         """Scene variables for the next tick (``lux``, ``lux_map``, ``speed``)."""
@@ -393,39 +396,73 @@ class ReflexStage:
         try:
             from senseai_reflex.config import ReflexConfig
             from senseai_reflex.engine import ReflexEngine
+            from senseai_reflex.motion import Footprint
         except ImportError as e:
             self.stats.available = False
             self.stats.reason = f"senseai-reflex not installed ({e.name}); watchdog drives the bridge"
             return
-        self.engine = ReflexEngine(ReflexConfig.from_mapping(self.config), None)
+        cfg = ReflexConfig.from_dict(self.config)
+        self._footprint = Footprint(radius_m=self.robot.footprint_radius_m)
+        self.engine = ReflexEngine(cfg, footprint=self._footprint, warm=False)
         self.available = True
+        self.set_profile(None)
+
+    def set_profile(self, profile: Any | None) -> None:
+        """Install a profile's ``ReflexPrior`` (with its name and version); ``None`` is the null profile."""
+        if not self.available:
+            return
+        if profile is None:
+            from senseai_reflex.profile_io import NULL_PRIOR
+
+            self.engine.set_prior(NULL_PRIOR, name="null", version=0)
+        else:
+            self.engine.set_profile(profile)
 
     def step(
-        self, surprise: Any | None, motion: MotionContext, t_ns: int, profile_ref: tuple[str, int]
+        self,
+        surprise: Any | None,
+        motion: MotionContext,
+        t_ns: int,
+        profile_ref: tuple[str, int],
+        t_sensor_ns: int | None = None,
     ) -> Any:
-        """One tick. Always returns a command; never raises past the pipeline."""
-        if self.available and surprise is not None:
+        """One tick. Always returns a command; never raises past the pipeline.
+
+        ``t_sensor_ns`` is the oldest sample time in the tick; reflex uses it for
+        ``provenance.latency.pipeline_ns`` (sensor → command). With reflex installed, a tick
+        without a surprise map still goes to the engine: its envelope watchdog is the primary
+        (``slow`` then ``brake``, ``provenance.degraded``). The SDK watchdog only covers a reflex
+        stage that raises, or a missing reflex.
+        """
+        if self.available:
             try:
-                cmd = _timed(self.stats, lambda: self.engine.step(surprise, self._robot_state(motion), t_ns))
+                state = self._robot_state(motion, t_sensor_ns)
+                # ReflexEngine reuses one command object; hand out a snapshot callers can keep
+                cmd = _timed(self.stats, lambda: self.engine.step(surprise, state, t_ns).copy())
             except Exception as e:
                 self.stats.fail(e)
             else:
-                self._last_ok_ns = t_ns
-                self.watchdog = "idle"
+                if surprise is not None:
+                    self._last_ok_ns = t_ns
+                self.watchdog = (
+                    "brake"
+                    if cmd.stop and cmd.provenance.degraded
+                    else ("slow" if cmd.provenance.degraded else "idle")
+                )
                 return cmd
-        if surprise is not None and not self.available:
+        elif surprise is not None:
             self.stats.latency.add(0)
         return self._watchdog_cmd(t_ns, profile_ref, surprise is None)
 
-    def _robot_state(self, m: MotionContext) -> Any:
+    def _robot_state(self, m: MotionContext, t_sensor_ns: int | None = None) -> Any:
         from senseai_reflex.motion import RobotState
 
         return RobotState(
-            v=m.speed_mps,
-            omega=m.yaw_rate_rps,
-            heading=m.heading_rad,
-            speed_cap=m.speed_cap_mps,
-            footprint_radius_m=m.footprint_radius_m,
+            v_mps=m.speed_mps,
+            omega_rps=m.yaw_rate_rps,
+            speed_cap_mps=m.speed_cap_mps,
+            footprint=self._footprint,
+            t_sensor_ns=t_sensor_ns,
         )
 
     def _watchdog_cmd(self, t_ns: int, profile_ref: tuple[str, int], no_surprise: bool) -> FallbackCommand:
@@ -460,12 +497,12 @@ class ReflexStage:
 
     def state(self) -> bytes:
         """Latch and ramp state (empty without reflex)."""
-        return bytes(self.engine.checkpoint_state()) if self.available else b""
+        return pickle.dumps(self.engine.checkpoint_state()) if self.available else b""
 
     def restore(self, blob: bytes) -> None:
         """Restore :meth:`state`."""
         if self.available and blob:
-            self.engine.restore_state(blob)
+            self.engine.restore_state(pickle.loads(blob))  # our own checkpoint, never external input
 
 
 # -- cortex -----------------------------------------------------------------------------------

@@ -179,7 +179,7 @@ class Telemetry:
         self.spool_dir.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%f")
         self._path = self.spool_dir / f"telemetry-{stamp}.jsonl"
-        self._file = self._path.open("a")
+        self._file = self._path.open("a", buffering=1)  # line-buffered: a crash loses at most one record
         self._bytes = 0
 
     def _write(self, rec: dict[str, Any]) -> None:

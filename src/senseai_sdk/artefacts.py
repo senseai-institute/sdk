@@ -58,6 +58,16 @@ RELEASE_PUBLIC_KEYS_HEX: tuple[str, ...] = (
 _ID_RE = re.compile(r"^(?P<kind>[a-z][a-z0-9-]*?)-v(?P<version>\d+(?:\.\d+)*)$")
 
 
+def profile_artefact_prefix(name: str) -> str:
+    """``profile-<name>-v`` with ``_`` spelled ``-`` (artefact ids allow ``[a-z0-9-]`` only)."""
+    return f"profile-{name.replace('_', '-')}-v"
+
+
+def profile_artefact_id(name: str, version: int | str) -> str:
+    """The artefact id of profile ``name`` version ``version``, e.g. ``profile-panther-vision-v0``."""
+    return f"{profile_artefact_prefix(name)}{version}"
+
+
 def parse_artefact_id(artefact_id: str) -> tuple[str, str]:
     """Split ``world-v1.2`` into ``("world", "1.2")``. The kind may contain dashes."""
     m = _ID_RE.match(artefact_id)

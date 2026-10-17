@@ -13,6 +13,7 @@ from senseai_sdk import SenseAI
 from senseai_sdk.bridges import CallbackBridge, PlannerCommand
 from senseai_sdk.errors import ArtefactError, LicenceError, PipelineError
 from senseai_sdk.licence import issue_licence
+from senseai_sdk.stages import FallbackCommand
 from tests.conftest import base_config
 
 TODAY = dt.date(2026, 10, 17)
@@ -29,7 +30,11 @@ def test_quickstart_shape(config_path: Path) -> None:
     assert h.ticks == len(cmds) and h.licence == "valid"
     assert h.artefacts == {"world": "world-v0.0", "reflex": "reflex-v0.0"}
     assert sai.meter.reports and sai.meter.reports[0]["ticks"] == {"null": len(cmds)}
-    assert sai.meter.reports[0]["senses"]["null"]["event"] == len(cmds)
+    # senses are metered on ticks that carried data; the threaded runner adds wall-clock watchdog
+    # ticks (FallbackCommand) between data ticks, and how many depends on machine speed
+    sensed = sai.meter.reports[0]["senses"]["null"]["event"]
+    assert 45 <= sensed <= len(cmds)
+    assert not any(isinstance(c, FallbackCommand) for c in cmds)  # reflex decided every tick
 
 
 def test_start_stop(config_path: Path) -> None:
@@ -122,13 +127,15 @@ def test_bridge_and_context(config_path: Path) -> None:
     sai.update_context(speed=1.0)
     with pytest.raises(KeyError):
         sai.update_context(lumens=1)
-    sai.step()
-    assert acts and acts[-1].linear == 0.0  # watchdog brake: reflex not installed
+    r = sai.step()
+    # quiet fixture: reflex passes the planner command through (speed × 1.0)
+    assert acts and acts[-1] == PlannerCommand(1.0, 0.1)
     sai.bind_actuator(CallbackBridge(lambda c: acts.append(PlannerCommand(9.0, 9.0))))
     sai.step()
     assert acts[-1] == PlannerCommand(9.0, 9.0)
-    with pytest.raises(PipelineError, match="needs senseai-reflex"):
-        sai.explain(0)
+    assert "profile null v0" in sai.explain(r.t_master_ns)
+    with pytest.raises(KeyError):
+        sai.explain(r.t_master_ns - 1)  # before the first command in the audit log
     sai.stop()
 
 

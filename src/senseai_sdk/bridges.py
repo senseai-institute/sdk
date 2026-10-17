@@ -2,11 +2,12 @@
 """Controller bridges: how a reflex command modifies the planner's command.
 
 ``senseai-reflex`` owns ``ControllerBridge`` and ships the ``callback`` and ``ros2_cmd_vel``
-bridges. Until it does, the SDK carries this minimal callback bridge so the fail-safe path
-(watchdog → bridge → controller) is real today. It implements exactly the rule the reflex
-README states: speed × ``speed_scale``, lateral offset as a bounded angular nudge, zero on
-``stop``. When ``senseai_reflex.bridge`` ships, :func:`make_bridge` returns its classes and
-this file keeps only the protocol.
+bridges. The SDK's ``callback`` bridge is its own (:class:`CallbackBridge`): it is part of
+the SDK's public API (``on_actuator`` receives an SDK :class:`PlannerCommand`) and must work
+on the watchdog path even when the reflex stage fails. It implements the reflex rule: speed ×
+``speed_scale``, lateral offset as a bounded angular nudge, zero on ``stop``.
+``ros2_cmd_vel`` wraps reflex's ``CmdVelBridge`` in :class:`ReflexBridgeAdapter`, which
+converts between the SDK's and reflex's planner/actuator types.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["BridgeLike", "CallbackBridge", "PlannerCommand", "make_bridge"]
+__all__ = ["BridgeLike", "CallbackBridge", "PlannerCommand", "ReflexBridgeAdapter", "make_bridge"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,26 +83,52 @@ class CallbackBridge:
         return out
 
 
+class ReflexBridgeAdapter:
+    """Presents a ``senseai_reflex.bridge.base.ControllerBridge`` with the SDK's bridge shape.
+
+    The pipeline hands it an SDK :class:`PlannerCommand` (``linear``/``angular``); reflex wants
+    its own ``PlannerCommand`` (``linear_mps``/``angular_rps``) and returns an
+    ``ActuatorCommand`` (or ``None`` when unhealthy), which is converted back.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        from senseai_reflex.bridge.base import PlannerCommand as ReflexPlanner
+
+        self.inner = inner
+        self._planner = ReflexPlanner()
+        self.last: PlannerCommand = PlannerCommand()
+
+    def apply(self, cmd: Any, planner_cmd: Any) -> PlannerCommand | None:
+        """Apply through the reflex bridge; ``None`` when it is unhealthy (nothing delivered)."""
+        p = planner_cmd if isinstance(planner_cmd, PlannerCommand) else PlannerCommand()
+        self._planner.linear_mps, self._planner.angular_rps = p.linear, p.angular
+        out = self.inner.apply(cmd, self._planner)
+        if out is None:
+            return None
+        self.last = PlannerCommand(out.linear_mps, out.angular_rps)
+        return self.last
+
+
 def make_bridge(name: str, **kw: Any) -> Any:
-    """Build the bridge ``name`` from config: ``senseai_reflex``'s when installed, else the SDK's.
+    """Build the bridge ``name`` from config.
+
+    ``callback`` is the SDK's :class:`CallbackBridge`. ``ros2_cmd_vel`` is reflex's
+    ``CmdVelBridge`` behind :class:`ReflexBridgeAdapter`.
 
     Raises:
-        PipelineError: ``ros2_cmd_vel`` without ``senseai_reflex`` (it needs the reflex ROS node).
+        PipelineError: ``ros2_cmd_vel`` without ``senseai_reflex``, or an unknown name.
     """
     from senseai_sdk.errors import PipelineError
 
-    try:
-        import importlib
-
-        mod = importlib.import_module(
-            "senseai_reflex.bridge." + ("ros2_cmd_vel" if name == "ros2_cmd_vel" else "callback")
-        )
-    except ImportError:
-        if name == "ros2_cmd_vel":
-            raise PipelineError(
-                "reflex.bridge: ros2_cmd_vel needs senseai-reflex[ros2], which is not installed; "
-                "use bridge: callback until it ships"
-            ) from None
+    if name == "callback":
         return CallbackBridge(**kw)
-    cls = getattr(mod, "Ros2CmdVelBridge" if name == "ros2_cmd_vel" else "CallbackBridge")
-    return cls(**kw)
+    if name != "ros2_cmd_vel":
+        raise PipelineError(f"reflex.bridge: unknown bridge {name!r}; use callback or ros2_cmd_vel")
+    try:
+        from senseai_reflex.bridge.ros2_cmd_vel import CmdVelBridge
+    except ImportError:
+        raise PipelineError(
+            "reflex.bridge: ros2_cmd_vel needs senseai-reflex, which is not installed; use bridge: callback"
+        ) from None
+    kw.pop("max_lateral_m", None)  # reflex's envelope bounds the lateral offset itself
+    return ReflexBridgeAdapter(CmdVelBridge(**kw))

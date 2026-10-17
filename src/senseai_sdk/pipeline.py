@@ -23,13 +23,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from senseai_sdk.artefacts import Artefact, ArtefactStore
+from senseai_sdk.artefacts import Artefact, ArtefactStore, profile_artefact_id, profile_artefact_prefix
 from senseai_sdk.bridges import BridgeLike, PlannerCommand, make_bridge
 from senseai_sdk.config import Config
 from senseai_sdk.errors import ArtefactError, PipelineError
 from senseai_sdk.health import Health, LatencyRing, StageStats
 from senseai_sdk.stages import (
     CortexStage,
+    FallbackCommand,
     IngestStage,
     MotionContext,
     ProfilesStage,
@@ -48,6 +49,12 @@ EventCallback = Callable[[Any], None]
 LicenceState = Callable[[], tuple[str, int]]
 
 
+def oldest_sample_ns(tick: Any) -> int | None:
+    """Master-clock time of the oldest sample in an ``AlignedTick`` (None for an empty tick)."""
+    ts = [int(smp.t_master_ns) for samples in tick.samples.values() for smp in samples]
+    return min(ts) if ts else None
+
+
 @dataclass(slots=True)
 class StepResult:
     """What one tick produced. See ``SenseAI.step``."""
@@ -62,6 +69,8 @@ class StepResult:
     actuator: PlannerCommand | None = None
     reasons: list[str] = field(default_factory=list)
     tick: Any | None = None  # the AlignedTick, only when Pipeline.keep_ticks (telemetry raw_frames)
+    t_sensor_ns: int | None = None  # oldest sample time in the tick (master clock), None without data
+    t_emit_ns: int = 0  # wall clock (time.time_ns) when the command left the reflex, before the bridge
 
 
 class Pipeline:
@@ -184,7 +193,9 @@ class Pipeline:
         if name == "null" and version is None:
             self._queue(lambda p: p._set_profile(None))
             return None
-        art = self.store.fetch(f"profile-{name}-v{version if version is not None else self._newest(name)}")
+        art = self.store.fetch(
+            profile_artefact_id(name, version if version is not None else self._newest(name))
+        )
         prof = self.profiles.load(art, name, version)
         self.artefacts["profile"] = art
         self._queue(lambda p: p._set_profile(prof))
@@ -196,18 +207,19 @@ class Pipeline:
             raise ArtefactError(f"profile {name!r}: pin a version in config when the store is remote")
         from pathlib import Path
 
-        prefix = f"profile-{name}-v"
+        prefix = profile_artefact_prefix(name)
         root = Path(str(self.store.store)).expanduser()
         versions = sorted(
             int(p.name[len(prefix) :]) for p in root.glob(prefix + "*") if p.name[len(prefix) :].isdigit()
         )
         if not versions:
-            raise ArtefactError(f"profile {name!r}: no profile-{name}-v* in {root}")
+            raise ArtefactError(f"profile {name!r}: no {prefix}* in {root}")
         return versions[-1]
 
     def _set_profile(self, profile: Any | None) -> None:
         if profile is None:
             self.tokens.tokenizer.set_profile(None)
+            self.reflex.set_profile(None)
             self.profiles.active = None
             self.profiles.active_ref = ("null", 0)
             return
@@ -334,23 +346,8 @@ class Pipeline:
                 surprise, world_state = out
                 lat["world"] = self._lat(self.world.stats)
 
-        cmd = self.reflex.step(surprise, self.motion, t_ns, self.profiles.active_ref)
-        if self.reflex.available:
-            lat["reflex"] = self._lat(self.reflex.stats)
-        if getattr(cmd, "degraded", False):
-            reasons.append(cmd.provenance.reason)
-
-        t_b = time.perf_counter_ns()
-        planner = self.bridge.planner_cmd() if hasattr(self.bridge, "planner_cmd") else PlannerCommand()
-        actuator = self._guard(self.sdk_stats, lambda: self.bridge.apply(cmd, planner), reasons, "bridge")
-        lat["bridge"] = time.perf_counter_ns() - t_b
-
-        for cb in self._cmd_cbs:
-            try:
-                cb(cmd)
-            except Exception as e:
-                self.sdk_stats.fail(e)
-                reasons.append(f"on_command callback raised {type(e).__name__}")
+        t_sensor = oldest_sample_ns(tick)
+        cmd, actuator, t_emit = self.reflex_path(surprise, t_ns, lat, reasons, t_sensor_ns=t_sensor)
 
         events = self.cortex.step(tick.index, world_state, surprise, cmd, batch)
         if self.cortex.available:
@@ -372,19 +369,33 @@ class Pipeline:
             actuator=actuator if isinstance(actuator, PlannerCommand) else None,
             reasons=reasons,
             tick=tick if self.keep_ticks else None,
+            t_sensor_ns=t_sensor,
+            t_emit_ns=t_emit,
         )
         self.finish_tick(res, t_start)
         return res
 
     def reflex_path(
-        self, surprise: Any | None, t_ns: int, lat: dict[str, int], reasons: list[str]
-    ) -> tuple[Any, Any]:
-        """Reflex → bridge → command callbacks. Always produces a command and calls the bridge."""
-        cmd = self.reflex.step(surprise, self.motion, t_ns, self.profiles.active_ref)
+        self,
+        surprise: Any | None,
+        t_ns: int,
+        lat: dict[str, int],
+        reasons: list[str],
+        *,
+        t_sensor_ns: int | None = None,
+    ) -> tuple[Any, Any, int]:
+        """Reflex → bridge → command callbacks. Always produces a command and calls the bridge.
+
+        Returns the command, the actuator command and the wall-clock emit time (ns).
+        """
+        cmd = self.reflex.step(surprise, self.motion, t_ns, self.profiles.active_ref, t_sensor_ns)
+        t_emit = time.time_ns()
         if self.reflex.available:
             lat["reflex"] = self._lat(self.reflex.stats)
-        if getattr(cmd, "degraded", False):
+        if isinstance(cmd, FallbackCommand):
             reasons.append(cmd.provenance.reason)
+        elif cmd.provenance.degraded:
+            reasons.append(f"reflex watchdog: {self.reflex.watchdog} (no SurpriseMap)")
         t_b = time.perf_counter_ns()
         planner = self.bridge.planner_cmd() if hasattr(self.bridge, "planner_cmd") else PlannerCommand()
         actuator = self._guard(self.sdk_stats, lambda: self.bridge.apply(cmd, planner), reasons, "bridge")
@@ -395,7 +406,7 @@ class Pipeline:
             except Exception as e:  # a customer callback never stops the pipeline
                 self.sdk_stats.fail(e)
                 reasons.append(f"on_command callback raised {type(e).__name__}")
-        return cmd, actuator
+        return cmd, actuator, t_emit
 
     def cortex_path(
         self, tick_index: int, world_state: Any, surprise: Any, cmd: Any, batch: Any, lat: dict[str, int]

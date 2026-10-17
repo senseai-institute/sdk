@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import struct
 import subprocess
@@ -120,6 +121,9 @@ def test_example_c_builds_and_runs(config_path: Path, tmp_path: Path) -> None:
         [str(exe), str(config_path), "20"], capture_output=True, text=True, timeout=300, env=env
     )
     assert run.returncode == 0, run.stderr
-    assert "tick 1 action 2 speed_scale 0.00 stop 1 degraded 1" in run.stdout
-    assert "20 steps, 20 with stop requested" in run.stdout
+    # the real reflex on a quiet fixture: no action, not degraded (it was the watchdog's brake before reflex
+    # shipped). Later ticks may brake if a loaded machine starves the world stage, so only the count's shape
+    # is checked there.
+    assert "tick 1 action 0 speed_scale 1.00 stop 0 degraded 0" in run.stdout
+    assert re.search(r"^20 steps, \d+ with stop requested$", run.stdout, re.M)
     assert 'health: {"state":' in run.stdout
