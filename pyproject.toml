@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "senseai-sdk"
+version = "0.1.0"
+description = "SenseAI perception layer: the one package a customer installs."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "SenseAI Institute" }]
+requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering",
+  "Typing :: Typed",
+]
+# The six runtime packages are not on PyPI (private stack); they are pinned to git in the
+# wheel metadata and overridden to local checkouts for development in [tool.uv.sources].
+# senseai-reflex and senseai-cortex are not started yet (empty repositories): they are
+# optional until they exist, and the SDK reports them as missing stages.
+dependencies = [
+  "numpy>=1.26",
+  "h5py>=3.10",
+  "pyyaml>=6.0",
+  "cryptography>=42",
+  "senseai-ingest @ git+https://github.com/senseai-institute/ingest@087b98408f4bcfd83f26ebb66dc4ed616441e341",
+  "senseai-tokens @ git+https://github.com/senseai-institute/tokens@7b12b1e",
+  "senseai-profiles @ git+https://github.com/senseai-institute/profiles@9ef8e20#subdirectory=packages/senseai-profiles",
+  "senseai-world @ git+https://github.com/senseai-institute/world@8bfaee9",
+]
+
+[project.optional-dependencies]
+ros2 = []        # rclpy and launch come from the ROS 2 install, not PyPI
+jetson = []      # marker: torch comes from NVIDIA's wheel index on Jetson
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "types-PyYAML>=6.0",
+  "pillow>=10.0",
+]
+
+[project.scripts]
+senseai = "senseai_sdk.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/senseai-institute/sdk"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/senseai_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "benchmarks", "README.md", "LICENSE", "Makefile"]
+
+[tool.uv.sources]
+senseai-tokens = { path = "../tokens", editable = true }
+senseai-profiles = { path = "../profiles/packages/senseai-profiles", editable = true }
+senseai-world = { path = "../world", editable = true }
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["src", "tests", "benchmarks", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF", "D"]
+ignore = ["D105", "D107", "D203", "D213", "D401", "D413", "N818"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"benchmarks/**" = ["D"]
+"examples/**" = ["D"]
+"src/senseai_sdk/ros2/**" = ["D"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests", "benchmarks", "examples"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["h5py", "h5py.*", "rclpy", "rclpy.*", "launch", "launch.*", "launch_ros", "launch_ros.*",
+          "senseai_reflex", "senseai_reflex.*", "senseai_cortex", "senseai_cortex.*",
+          "senseai_tokens.*", "senseai_world.*", "senseai_profiles.*", "senseai_ingest.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = ["slow: longer end-to-end tests"]
+
+[tool.coverage.run]
+source = ["senseai_sdk"]
+branch = true
+omit = ["*/ros2/*", "*/capi/shim.py"]
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@abstractmethod", "\\.\\.\\."]
+fail_under = 85
+show_missing = true
+skip_covered = true
