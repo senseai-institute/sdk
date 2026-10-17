@@ -83,7 +83,9 @@ telemetry: {enabled: true, raw_frames: false, upload: null}
 | `licence_key` | str | required | Signed licence key. `${VAR}` expands from the environment. |
 | `profile.name` | str | `null` | Profile to load at start. `null` is the no-op profile and is always allowed. |
 | `profile.version` | int | newest allowed | Pins a profile version. A pinned version that is missing fails at start, never silently. |
-| `artefacts.world` | str | required | World-model artefact id (`<name>-v<semver>`). Its bundle also carries the tokenizer config and weights the checkpoint was trained with, so you never configure the tokenizer yourself. |
+| `artefacts.world` | str | required | World-model artefact id (`<name>-v<semver>`). Its bundle carries the tokenizer config the model was built against, so you never configure the tokenizer yourself. In `learned`/`fused` mode it holds `checkpoint.ckpt`; in `prior` mode it holds no checkpoint at all (`tokens.yaml`, `world.yaml`, `library.yaml`). |
+| `world.mode` | `learned`, `prior`, `fused` | `learned` | How surprise is produced. See [World modes](#world-modes). |
+| `world.library` | path | from the artefacts | Species library entry (YAML) the prior reads its measured parameters from. Default: the world artefact's `library.yaml`, else `library/felidae.yaml` from the profile artefact, else the prior's flagged defaults. |
 | `artefacts.reflex` | str | required | Reflex artefact id. |
 | `artefacts.cache` | path | `~/.senseai` | Local artefact cache. Artefacts are verified each time they load, not just when they are fetched. |
 | `artefacts.store` | path or URL | `${cache}/store` | Where artefacts are fetched from: a local directory or an HTTPS base URL. Profile bundles are `profile-<name>-v<N>` in the same store. |
@@ -131,6 +133,26 @@ still reachable, but you don't need it.
 | `save_state(path)` / `load_state(path)` | Checkpoints tokenizer, world, reflex and cortex state, so a restart skips the warm-up. |
 
 The full docstrings are in `src/senseai_sdk/api.py`.
+
+### World modes
+
+The world stage can run three ways (`world.mode`), with the same `SurpriseMap` going to the
+reflex in each:
+
+| mode | what runs | needs | when |
+|---|---|---|---|
+| `learned` (default) | `senseai_world.WorldModel` from the artefact's checkpoint | a trained checkpoint | production, once a model is trained on the deployment's data |
+| `prior` | `senseai_world.prior.PriorWorldModel`: the structured biological prior (token flow + predictive coverage), **no weights, no training** | `tokens.yaml` and a species library entry; no checkpoint | **no training: first real-data run.** The Zurich-night POC runs Panther this way. |
+| `fused` | `FusedWorldModel`: checkpoint and prior, surprise fused per token | both | a trained model plus the prior's floor |
+
+The mode and the model id are in `health().artefacts` (`world_mode`, `world_model`,
+`world_prior`, `world_library`) and in every `StepResult` (`world_mode`, `world_model_id`), so a
+command's provenance always says which world produced the surprise it reacted to. Prior mode
+emits no `WorldState` (there is no latent set), so cortex sees surprise only.
+
+```bash
+uv run python examples/replay_dsec.py /data/dsec/zurich_city_09_a --profile panther_vision --world-mode prior
+```
 
 ### Single-loop vs threaded
 
@@ -216,7 +238,7 @@ stays authoritative. The `ros2_cmd_vel` bridge is reflex's `CmdVelBridge`.
 
 ## Artefacts and licence
 
-**Artefacts.** The world checkpoint (with its tokenizer config and weights), the reflex
+**Artefacts.** The world bundle (checkpoint and/or species library, with its tokenizer config), the reflex
 weights and the profile `.npz` priors each ship with a manifest. The manifest lists sha256
 hashes and carries an Ed25519 signature from SenseAI's release key. The SDK checks the
 signature and every hash each time it loads an artefact. A tampered, unsigned or unpinned

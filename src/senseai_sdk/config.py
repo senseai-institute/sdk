@@ -34,6 +34,7 @@ __all__ = [
     "RobotConfig",
     "SensorConfig",
     "TelemetryConfig",
+    "WorldModeConfig",
     "template",
 ]
 
@@ -70,6 +71,23 @@ class ArtefactsConfig:
     store: Path | str = field(  # a directory, or an HTTPS base URL
         default_factory=lambda: Path("~/.senseai/store").expanduser()
     )
+
+
+@dataclass(frozen=True, slots=True)
+class WorldModeConfig:
+    """``world:`` — how the world stage produces surprise.
+
+    Attributes:
+        mode: ``learned`` (the artefact's checkpoint, the default), ``prior`` (the structured
+            biological prior: no weights, no training; the artefact carries no checkpoint) or
+            ``fused`` (checkpoint and prior, surprise fused per token).
+        library: A species library entry (YAML) the prior reads its measured parameters from.
+            Default: the ``library.yaml`` in the world artefact, else ``library/felidae.yaml``
+            from the profile artefact, else the prior's flagged defaults.
+    """
+
+    mode: Literal["learned", "prior", "fused"] = "learned"
+    library: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +169,7 @@ class Config:
     sensors: tuple[SensorConfig, ...]
     profile: ProfileRef = ProfileRef()
     robot: RobotConfig = RobotConfig()
+    world: WorldModeConfig = WorldModeConfig()
     tick_ms: int = 10
     reflex: ReflexConfig = ReflexConfig()
     cortex: CortexConfig = CortexConfig()
@@ -202,6 +221,7 @@ class Config:
             sensors=sensors,
             profile=_profile(n.section("profile")),
             robot=_robot(n.section("robot")),
+            world=_world(n.section("world")),
             tick_ms=n.integer("tick_ms", default=10, min=1),
             reflex=_reflex(n.section("reflex")),
             cortex=_cortex(n.section("cortex")),
@@ -372,6 +392,7 @@ _TOP_KEYS = (
     "profile",
     "artefacts",
     "robot",
+    "world",
     "sensors",
     "tick_ms",
     "reflex",
@@ -401,6 +422,14 @@ def _artefacts(n: _Node) -> ArtefactsConfig:
         reflex=n.text("reflex", required=True),
         cache=cache,
         store=store,
+    )
+
+
+def _world(n: _Node) -> WorldModeConfig:
+    n.check_keys(("mode", "library"))
+    return WorldModeConfig(
+        mode=n.text("mode", default="learned", one_of=("learned", "prior", "fused")),
+        library=n.path("library"),
     )
 
 
@@ -545,6 +574,10 @@ artefacts:
   reflex: reflex-v1.0               # signed reflex bundle
   cache: ~/.senseai                 # local cache; every load re-verifies signatures
   # store: https://artefacts.senseai.example/   # where to fetch from; default is <cache>/store
+
+world:
+  mode: learned                     # learned (checkpoint) | prior (no training; species prior) | fused (both)
+  # library: library/felidae.yaml   # species library entry for the prior; default from the artefacts
 
 robot:
   footprint_radius_m: 0.35          # circle that contains the robot

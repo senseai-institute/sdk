@@ -6,9 +6,12 @@
         --world-ckpt runs/dsec_night/last.ckpt --tokens-yaml runs/dsec_night/tokens.yaml \\
         --audit-out panther_09a.h5
 
-Without ``--world-ckpt`` the world model is the SDK's tiny *untrained* fixture, so the reflex
-decisions mean nothing; the run proves the plumbing. With your checkpoint (trained on tokens.h5
-files made with the same ``tokens.yaml``) it is the real pipeline. Artefacts are signed with a
+``--world-mode prior`` needs no checkpoint at all: the structured species prior (no training,
+``--prior-library`` selects the library entry, default felidae) produces the surprise maps. This
+is the "no training: first real-data run" mode. Without ``--world-ckpt`` in ``learned`` mode the
+world model is the SDK's tiny *untrained* fixture, so the reflex decisions mean nothing; the run
+proves the plumbing. ``fused`` combines a checkpoint with the prior. With your checkpoint (trained
+on tokens.h5 files made with the same ``tokens.yaml``) it is the real pipeline. Artefacts are signed with a
 throwaway key and a test licence is issued, both in a temporary directory: development only.
 
 Prints one line per tick for the first ticks and every ``--every`` ticks after, then counts by
@@ -42,6 +45,15 @@ def main() -> int:
     ap.add_argument("--world-ckpt", type=Path, help="your senseai-world checkpoint")
     ap.add_argument("--tokens-yaml", type=Path, help="the tokens.yaml the checkpoint was trained against")
     ap.add_argument("--reflex-yaml", type=Path, help="reflex config (default: Gate 1 defaults)")
+    ap.add_argument(
+        "--world-mode",
+        choices=["learned", "prior", "fused"],
+        default="learned",
+        help="learned = checkpoint; prior = structured species prior, no training; fused = both",
+    )
+    ap.add_argument(
+        "--prior-library", type=Path, help="species library YAML for the prior (default: felidae)"
+    )
     ap.add_argument("--speed", type=float, default=1.5, help="vehicle speed fed to the reflex, m/s")
     ap.add_argument("--ticks", type=int, default=0, help="stop after this many ticks (0 = whole sequence)")
     ap.add_argument("--every", type=int, default=100, help="print every N-th tick after the first 5")
@@ -60,10 +72,16 @@ def main() -> int:
             world_checkpoint=a.world_ckpt,
             tokens_yaml=a.tokens_yaml,
             reflex_yaml=a.reflex_yaml,
+            world_mode=a.world_mode,
+            library=a.prior_library,
         )
         os.environ["SENSEAI_RELEASE_KEYS"] = Keyring.from_private(key).public_hex()[0]
         cfg = fixture_config(store, root / "cache", licence_key=issue_test_licence(key))
         cfg["profile"] = {"name": a.profile}
+        cfg["world"] = {
+            "mode": a.world_mode,
+            **({"library": str(a.prior_library)} if a.prior_library else {}),
+        }
         cfg["robot"] = {"speed_cap_mps": max(a.speed, 0.1)}
         cfg["sensors"] = [
             {"id": "events_left", "adapter": "dsec", "path": str(seq), "spec": "generic_event_camera"},
@@ -103,7 +121,10 @@ def _run(sai: SenseAI, a: argparse.Namespace) -> int:
         sai.save_audit(a.audit_out)
         print(f"audit log: {a.audit_out}")
     sai.stop()
-    print(f"\n{n} ticks, profile {a.profile}: " + ", ".join(f"{k} {v}" for k, v in sorted(actions.items())))
+    print(
+        f"\n{n} ticks, profile {a.profile}, world {a.world_mode} ({h.artefacts.get('world_model')}): "
+        + ", ".join(f"{k} {v}" for k, v in sorted(actions.items()))
+    )
     print(f"SDK watchdog commands: {fallback}; world warming-up ticks: {warming}")
     print(h.summary())
     return 0 if n and not fallback else 1

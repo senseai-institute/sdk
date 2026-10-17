@@ -338,28 +338,129 @@ class ProfilesStage:
 
 
 class WorldStage:
-    """The ``senseai_world.WorldModel`` loaded from the world artefact's checkpoint."""
+    """The world stage in one of three modes (``config.world.mode``).
+
+    - ``learned``: ``senseai_world.WorldModel`` from the artefact's ``checkpoint.ckpt``.
+    - ``prior``: ``senseai_world.prior.PriorWorldModel``: the structured biological prior, no
+      weights, no training. The artefact carries ``tokens.yaml`` (+ ``world.yaml``, + a species
+      ``library.yaml``) and no checkpoint.
+    - ``fused``: ``FusedWorldModel`` over both, surprise fused per token.
+
+    ``mode``, ``model_id`` and ``prior_model_id`` are reported in health and in every
+    ``StepResult``.
+    """
 
     name = "world"
 
-    def __init__(self, world: Artefact, device: str = "auto") -> None:
-        from senseai_world.inference import WorldModel
-
+    def __init__(
+        self,
+        world: Artefact,
+        device: str = "auto",
+        *,
+        mode: str = "learned",
+        library: Path | None = None,
+        tokenizer_id: str | None = None,
+        tick_ns: int | None = None,
+    ) -> None:
         self.stats = StageStats(self.name)
-        self.model = WorldModel.load(world.path("checkpoint.ckpt"), device=device)
+        self.mode = mode
+        self.library: Path | None = None
+        self.prior_model_id: str | None = None
+        learned: Any = None
+        if mode in ("learned", "fused"):
+            from senseai_world.inference import WorldModel
+
+            learned = WorldModel.load(world.path("checkpoint.ckpt"), device=device)
+        prior: Any = None
+        if mode in ("prior", "fused"):
+            prior = self._build_prior(world, learned, library, tokenizer_id, tick_ns)
+            self.prior_model_id = str(prior.model_id)
+        if mode == "learned":
+            self.model: Any = learned
+        elif mode == "prior":
+            self.model = prior
+        elif mode == "fused":
+            from senseai_world.prior.fused import FusedWorldModel
+
+            self.model = FusedWorldModel(learned, prior)
+        else:
+            raise PipelineError(f"world.mode: unknown mode {mode!r}")
+        self.model_id: str = str(self.model.model_id)
         self.tick_ns: int = int(self.model.cfg.tick_ns or 0)
-        self.tokenizer_id: str | None = self.model.tokenizer_id
+        self.tokenizer_id: str | None = getattr(self.model, "tokenizer_id", None) or (
+            learned.tokenizer_id if learned is not None else None
+        )
+
+    def _build_prior(
+        self,
+        world: Artefact,
+        learned: Any,
+        library: Path | None,
+        tokenizer_id: str | None,
+        tick_ns: int | None,
+    ) -> Any:
+        from senseai_world.config import WorldConfig
+        from senseai_world.prior import PriorParams, PriorWorldModel
+
+        if learned is not None:
+            cfg = learned.cfg  # fused: the prior must share grid and surprise config with the checkpoint
+        else:
+            wcfg = (
+                yaml.safe_load(world.path("world.yaml").read_text()) if "world.yaml" in world.files else None
+            )
+            base = WorldConfig.from_dict(wcfg) if wcfg else WorldConfig()
+            tcfg = yaml.safe_load(world.path("tokens.yaml").read_text()) or {}
+            d_model = int(tcfg.get("d_model", 256))
+            budget = int((tcfg.get("global") or {}).get("budget", 1024))
+            tick = tick_ns or int(world.meta.get("tick_ms", 10)) * 1_000_000
+            cfg = base.resolve(d_model=d_model, tokens_per_tick=budget, tick_ns=tick)
+        lib = (
+            library
+            if library is not None
+            else (world.path("library.yaml") if "library.yaml" in world.files else None)
+        )
+        if lib is not None and not Path(lib).is_file():
+            raise PipelineError(f"world.library: {lib} does not exist")
+        self.library = Path(lib) if lib is not None else None
+        params = PriorParams.from_library(lib) if lib is not None else PriorParams()
+        tid = (
+            tokenizer_id
+            if tokenizer_id is not None
+            else (learned.tokenizer_id if learned is not None else None)
+        )
+        return PriorWorldModel(cfg, params, tokenizer_id=tid)
 
     def step(self, batch: Any) -> tuple[Any, Any]:
-        """``TokenBatch`` → ``(SurpriseMap, WorldState | None)``."""
+        """``TokenBatch`` → ``(SurpriseMap, WorldState | None)`` (``None`` always in prior mode)."""
         return _timed(self.stats, lambda: self.model.step(batch))  # type: ignore[no-any-return]
 
+    def describe(self) -> dict[str, str]:
+        """``{"world_mode", "world_model", "world_prior"?, "world_library"?}`` for health and provenance."""
+        d = {"world_mode": self.mode, "world_model": self.model_id}
+        if self.prior_model_id is not None:
+            d["world_prior"] = self.prior_model_id
+        if self.library is not None:
+            d["world_library"] = str(self.library)
+        return d
+
     def state(self) -> bytes:
-        """Checkpointable window and normaliser state."""
+        """Checkpointable window and normaliser state (both halves in fused mode)."""
+        if self.mode == "fused":
+            return pickle.dumps(
+                {
+                    "learned": self.model.learned.checkpoint_state(),
+                    "prior": self.model.prior.checkpoint_state(),
+                }
+            )
         return bytes(self.model.checkpoint_state())
 
     def restore(self, blob: bytes) -> None:
         """Restore :meth:`state`."""
+        if self.mode == "fused":
+            parts = pickle.loads(blob)
+            self.model.learned.restore_state(parts["learned"])
+            self.model.prior.restore_state(parts["prior"])
+            return
         self.model.restore_state(blob)
 
 

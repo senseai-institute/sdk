@@ -28,7 +28,8 @@ def test_quickstart_shape(config_path: Path) -> None:
     assert len(cmds) >= 50
     h = sai.health()
     assert h.ticks == len(cmds) and h.licence == "valid"
-    assert h.artefacts == {"world": "world-v0.0", "reflex": "reflex-v0.0"}
+    assert h.artefacts["world"] == "world-v0.0" and h.artefacts["reflex"] == "reflex-v0.0"
+    assert h.artefacts["world_mode"] == "learned" and h.artefacts["world_model"]  # provenance of the surprise
     assert sai.meter.reports and sai.meter.reports[0]["ticks"] == {"null": len(cmds)}
     # senses are metered on ticks that carried data; the threaded runner adds wall-clock watchdog
     # ticks (FallbackCommand) between data ticks, and how many depends on machine speed
