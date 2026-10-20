@@ -5,6 +5,7 @@
 
 - ``world-v0.0``: a tiny real ``senseai_world`` checkpoint plus the ``tokens.yaml`` it was
   built against (d_model 32, 128 tokens per tick, 10 ms ticks), with a consistent tokenizer id;
+- ``tokens-v0.0``: the same ``tokens.yaml`` alone, for ``artefacts.world: null`` (L1 circuits only);
 - ``reflex-v0.0``: a ``reflex.yaml`` for ``senseai_reflex.config.ReflexConfig`` (Gate 1 defaults);
 - ``profile-null-v0`` and ``profile-panther-v0``: the ``senseai-profiles`` library, specs,
   priors and sensor specs as self-contained artefacts (needs a checkout of the profiles
@@ -116,6 +117,10 @@ def build_fixture_store(
         )
         save_checkpoint(w / "checkpoint.ckpt", WorldNet(wcfg), provenance={"tokenizer_id": tok.tokenizer_id})
         _sign(w, "world-v0.0", key, {"tick_ms": 10, "d_model": D_MODEL})
+    t = root / "tokens-v0.0"
+    t.mkdir()
+    shutil.copy(w / "tokens.yaml", t / "tokens.yaml")
+    _sign(t, "tokens-v0.0", key, {"d_model": D_MODEL})
     r = root / "reflex-v0.0"
     r.mkdir()
     if reflex_yaml is not None:
@@ -157,15 +162,24 @@ def issue_test_licence(key: Ed25519PrivateKey) -> str:
 
 
 def fixture_config(
-    store: Path, cache: Path, *, licence_key: str = "TEST", seconds: float = 0.5, **over: Any
+    store: Path,
+    cache: Path,
+    *,
+    licence_key: str = "TEST",
+    seconds: float = 0.5,
+    world: str | None = "world-v0.0",
+    **over: Any,
 ) -> dict[str, Any]:
-    """A ``senseai.yaml`` mapping over the fixture store with synthetic replay sources."""
+    """A ``senseai.yaml`` mapping over the fixture store with synthetic replay sources.
+
+    ``world=None`` runs the L1 circuits alone, with the tokenizer from ``tokens-v0.0``.
+    """
     d: dict[str, Any] = {
         "endpoint_id": "test-0001",
         "licence_key": licence_key,
         "profile": {"name": "null"},
         "artefacts": {
-            "world": "world-v0.0",
+            "world": world,
             "reflex": "reflex-v0.0",
             "cache": str(cache),
             "store": str(store),
@@ -191,5 +205,7 @@ def fixture_config(
         ],
         "tick_ms": 10,
     }
+    if world is None:
+        d["artefacts"]["tokens"] = "tokens-v0.0"
     d.update(over)
     return d

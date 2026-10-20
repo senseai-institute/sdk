@@ -5,7 +5,7 @@ Threads (in pipeline order):
 
 1. **ingest**: pulls ticks from the aligner (paced to real time for replay) → ``q_ticks``
 2. **tokens**: applies queued between-tick hooks, tokenizes, updates profiles → ``q_batches``
-3. **world**: surprise → ``q_surprise``
+3. **surprise**: L1 circuits on the tick + its tokens → surprise → ``q_surprise``
 4. **reflex**: every ``tick_ms`` on the wall clock, takes the newest surprise (or none) and runs
    reflex → bridge → command callbacks; hands the result to ``q_cortex``
 5. **cortex**: events → event callbacks
@@ -95,7 +95,7 @@ class ThreadedRunner:
         for name, fn in (
             ("ingest", self._ingest),
             ("tokens", self._tokens),
-            ("world", self._world),
+            ("surprise", self._world),
             ("reflex", self._reflex),
             ("cortex", self._cortex),
         ):
@@ -134,7 +134,7 @@ class ThreadedRunner:
 
         import torch
 
-        if self.p.world.model.device.type != "cpu":
+        if self.p.surprise.model is None or self.p.surprise.model.device.type != "cpu":
             return
         n = self.torch_threads if self.torch_threads is not None else max(1, (os.cpu_count() or 2) // 2 - 1)
         torch.set_num_threads(n)
@@ -186,14 +186,26 @@ class ThreadedRunner:
                     continue
                 if item is _END:
                     break
+                # the L1 circuits run here, next to the learned model, rather than on the tokens thread:
+                # measured on 4 cores, that keeps the tokens queue from dropping
                 tick, batch, reasons = item
+                maps = p._guard(
+                    p.circuits.stats,
+                    lambda t=tick: p.circuits.step(t, p.motion.yaw_rate_rps),  # type: ignore[misc]
+                    reasons,
+                    "circuits",
+                )
                 surprise = world_state = None
-                if batch is not None:
-                    b = batch
-                    out = p._guard(p.world.stats, lambda: p.world.step(b), reasons, "world")  # noqa: B023
+                if batch is not None or maps is not None:
+                    out = p._guard(
+                        p.surprise.stats,
+                        lambda m=maps, b=batch: p.surprise.step(m, b),  # type: ignore[misc]
+                        reasons,
+                        "surprise",
+                    )
                     if out is not None:
                         surprise, world_state = out
-                self.q_surprise.put((tick, batch, surprise, world_state, reasons))
+                self.q_surprise.put((tick, maps, batch, surprise, world_state, reasons))
         finally:
             self.q_surprise.close()
 
@@ -217,13 +229,15 @@ class ThreadedRunner:
                 t_start = time.perf_counter_ns()
                 lat: dict[str, int] = {}
                 if item is not None:
-                    tick, batch, surprise, world_state, reasons = item
+                    tick, maps, batch, surprise, world_state, reasons = item
                     t_ns = int(tick.t_master_ns)
                     lat["ingest"] = p._lat(p.ingest.stats)
+                    if maps is not None:
+                        lat["circuits"] = p._lat(p.circuits.stats)
                     if batch is not None:
                         lat["tokens"] = p._lat(p.tokens.stats)
                     if surprise is not None:
-                        lat["world"] = p._lat(p.world.stats)
+                        lat["surprise"] = p._lat(p.surprise.stats)
                 else:  # nothing arrived this tick: the watchdog decides
                     tick = batch = surprise = world_state = None
                     reasons = ["no SurpriseMap within the tick"]
@@ -269,12 +283,12 @@ class ThreadedRunner:
         """Drops per queue, also mirrored into the stage stats."""
         d = {
             "tokens": self.q_ticks.drops,
-            "world": self.q_batches.drops,
+            "surprise": self.q_batches.drops,
             "reflex": self.q_surprise.drops,
             "cortex": self.q_cortex.drops,
         }
         self.p.tokens.stats.drops = d["tokens"]
-        self.p.world.stats.drops = d["world"]
+        self.p.surprise.stats.drops = d["surprise"]
         self.p.reflex.stats.drops = d["reflex"]
         self.p.cortex.stats.drops = d["cortex"]
         return d

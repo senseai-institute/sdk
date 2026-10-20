@@ -92,7 +92,12 @@ def run_checks(
     # 3. artefacts
     store = ArtefactStore(cfg.artefacts.store, cfg.artefacts.cache, keyring)
     arts: dict[str, Any] = {}
-    for kind, aid in (("world", cfg.artefacts.world), ("reflex", cfg.artefacts.reflex)):
+    wanted = (
+        ("world", cfg.artefacts.world),
+        ("tokens", cfg.artefacts.tokens),
+        ("reflex", cfg.artefacts.reflex),
+    )
+    for kind, aid in ((k, a) for k, a in wanted if a):
         try:
             arts[kind] = store.fetch(aid)
             yield Check(f"artefact {kind}", "ok", f"{aid} verified ({len(arts[kind].files)} files)")
@@ -136,9 +141,11 @@ def run_checks(
                 f"pip install {pkg.replace('_', '-')}",
             )
 
-    # 5. tick vs world artefact
+    # 5. tick vs world artefact (the L1 circuits run at any tick)
     world = arts.get("world")
-    if world is not None:
+    if cfg.artefacts.world is None:
+        yield Check("tick", "ok", f"{cfg.tick_ms} ms (no world artefact: L1 circuits only)")
+    elif world is not None:
         trained = world.meta.get("tick_ms")
         if trained is None:
             yield Check(

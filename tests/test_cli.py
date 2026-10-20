@@ -135,7 +135,11 @@ def test_bench(config_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[
     assert "end-to-end" in out and "sdk" in out and "45 ticks" in out
     assert "reflex " in out and "senseai-reflex not installed" not in out
     data = json.loads(out_file.read_text())
-    assert data["stages"]["world"]["p99_ms"] > 0 and data["sdk_overhead_p99_ms"] >= 0
+    assert (
+        data["stages"]["surprise"]["p99_ms"] > 0
+        and data["stages"]["circuits"]["p99_ms"] > 0
+        and data["sdk_overhead_p99_ms"] >= 0
+    )
     assert main(["bench", "--config", str(config_path), "--max-ticks", "10", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["ticks"] == 0  # 10 ticks all inside the 20-tick warm-up
 
@@ -156,7 +160,7 @@ def test_bench_on_tick_file(config: Config, tmp_path: Path) -> None:
     write_ticks(tf, ticks, al.specs(), tick_ns=config.tick_ns)
     al.close()
     res = run_bench(config, ticks_file=tf, warmup=5, device="cpu")
-    assert res.ticks == 45 and "world" in res.stages
+    assert res.ticks == 45 and "surprise" in res.stages and "circuits" in res.stages
 
 
 def test_logs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
