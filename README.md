@@ -7,7 +7,7 @@ meters the proprietary artefacts it loads, and adds nothing clever of its own.
 ```
  your sensors / recordings                       senseai-sdk                                  your robot
  ┌──────────────┐  ┌─────────────────────────────────────────────────────────────────────┐  ┌──────────────┐
- │ dvs0 rgb0    │─▶│ ingest ─▶ tokens ─▶ world ─▶ reflex ───────── ReflexCommand ────────┼─▶│ controller   │
+ │ dvs0 rgb0    │─▶│ ingest ─▶ circuits+tokens ─▶ surprise ─▶ reflex ── ReflexCommand ───┼─▶│ controller   │
  │ mic0 imu0 …  │  │   ▲          ▲        │         │  (≤ 15 ms sensor→actuator p99)    │  │ (/cmd_vel)   │
  └──────────────┘  │   │      profiles    └──▶ cortex ───────────── Event ───────────────┼─▶│ planner, LLM │
                    │ config · artefacts (signed) · licence · health · telemetry (opt-in)  │  │ fleet manager│
@@ -20,7 +20,10 @@ events. A new engineer can do this in under an hour without reading the other si
 **Status: implemented up to the packages that exist.** Config, signed artefacts, licence and
 metering, the single-loop and threaded pipelines, health, telemetry, the CLI, the C API and
 the ROS 2 bundle are built and tested (`ruff`, `mypy --strict`). The pipeline runs ingest →
-tokens → profiles → world → reflex; `senseai-cortex` is not started upstream, so no semantic
+circuits → tokens → profiles → surprise → reflex. `circuits` is the L1 producer
+([senseai-circuits](https://github.com/senseai-institute/circuits): fixed retina, motion and
+looming circuits, no weights), so a `SurpriseMap` exists with no trained model at all
+(`artefacts.world: null`); with a world artefact, `surprise` fuses it with the learned model; `senseai-cortex` is not started upstream, so no semantic
 events are emitted and health reports `degraded` for that reason alone.
 See [Upstream status](#upstream-status). `examples/replay_dsec.py` runs a DSEC sequence end to end,
 optionally with a world checkpoint you trained (see its docstring).
@@ -83,7 +86,8 @@ telemetry: {enabled: true, raw_frames: false, upload: null}
 | `licence_key` | str | required | Signed licence key. `${VAR}` expands from the environment. |
 | `profile.name` | str | `null` | Profile to load at start. `null` is the no-op profile and is always allowed. |
 | `profile.version` | int | newest allowed | Pins a profile version. A pinned version that is missing fails at start, never silently. |
-| `artefacts.world` | str | required | World-model artefact id (`<name>-v<semver>`). Its bundle also carries the tokenizer config and weights the checkpoint was trained with, so you never configure the tokenizer yourself. |
+| `artefacts.world` | str \| null | required | World-model artefact id (`<name>-v<semver>`). Its bundle also carries the tokenizer config and weights the checkpoint was trained with, so you never configure the tokenizer yourself. `null` runs the L1 circuits alone (`SurpriseMap.provenance.model_id` is `circuits-<version>`); with a world artefact the two are fused (element-wise max, `model_id` `<world>+circuits-<version>`). |
+| `artefacts.tokens` | str | none | Tokenizer artefact (`tokens.yaml`). Required when `artefacts.world` is null; otherwise the world bundle's tokenizer is used. Circuit knob values come from the active profile (its spec's `circuits:` block, then its prior bundle's `meta["circuits"]`), the place senseai-studio shows them. |
 | `artefacts.reflex` | str | required | Reflex artefact id. |
 | `artefacts.cache` | path | `~/.senseai` | Local artefact cache. Artefacts are verified each time they load, not just when they are fetched. |
 | `artefacts.store` | path or URL | `${cache}/store` | Where artefacts are fetched from: a local directory or an HTTPS base URL. Profile bundles are `profile-<name>-v<N>` in the same store. |
@@ -296,8 +300,9 @@ GPU. In threaded mode on the fixture at 100 ticks/s the queues drop nothing.
 | stage | budget p99 | measured by |
 |---|---|---|
 | ingest sync | < 1 ms | aligner stats |
+| circuits | ≤ 1 ms | stage stopwatch (L1, NumPy, host) |
 | tokens | ≤ 2 ms | tokenizer stopwatch |
-| world | ≤ 6 ms (CUDA) | `SurpriseMap.latency_ns` |
+| surprise | ≤ 6 ms (CUDA) | `SurpriseMap.latency_ns` (L1 producer + learned model when configured) |
 | reflex | < 1 ms | `ReflexCommand.provenance.latency_ns` |
 | transport | ≤ 3 ms | bridge publish timestamp |
 | SDK overhead | ≤ 1 ms | pipeline stopwatch minus the sum of stages |
@@ -338,7 +343,8 @@ The SDK composes these packages through their public contracts only:
 | `senseai-ingest` | `Adapter`, `Aligner`, `SourceSpec` | Gate 1: replay works; live adapters raise `AdapterNotAvailable`. |
 | `senseai-tokens` | `Tokenizer`, `TokenBatch` | Gate 1 complete on CPU. |
 | `senseai-profiles` | `Registry`, `Profile` | Gate 1; `panther.v0` and `null.v0` bundles. |
-| `senseai-world` | `WorldModel`, `SurpriseMap`, `WorldState` | Implemented; CPU `step()` p99 77–112 ms (over budget), CUDA not yet measured. |
+| `senseai-circuits` | `CircuitStage`, `SurpriseFromCircuits`, `SurpriseMap` contract | P1: panther vision (event cameras). Measured in this SDK on the fixture: circuits ≈ 0.9 ms, L1 surprise ≈ 0.4 ms per tick on CPU. |
+| `senseai-world` | `WorldModel`, `WorldState` (optional since L1) | Implemented; CPU `step()` p99 77–112 ms (over budget), CUDA not yet measured. |
 | `senseai-reflex` | `ReflexEngine`, `ReflexCommand`, `ControllerBridge`, `AuditLog` | Implemented (pinned at 9442c53; needs world 0a25692 or later for `SurpriseMap.has_bin_stats`). `ReflexStage` builds the engine from the reflex artefact's `reflex.yaml` (`ReflexConfig.from_dict`), feeds it `RobotState` with `t_sensor_ns` (oldest sample in the tick), installs the profile's `ReflexPrior` with its name and version, and hands out a snapshot of each command. `ros2_cmd_vel` uses reflex's `CmdVelBridge`. |
 | `senseai-cortex` | `CortexEngine`, `Event`, sinks | **Not started** (empty repository). No events are emitted; `on_event` callbacks and sinks are wired and idle. |
 

@@ -40,14 +40,14 @@ def test_spool_contents_and_upload(config: Config, tmp_path: Path) -> None:
     cfg = TelemetryConfig(enabled=True, raw_frames=False, upload="tests.test_telemetry:upload_ok")
     t = Telemetry(cfg, "e", tmp_path / "spool", sample_every=5, map_every=10, hist_every=20)
     t.attach(p)
-    real_world = p.world.step
+    real_step = p.surprise.step
 
-    def boom(_batch: Any) -> Any:
+    def boom(_maps: Any, _batch: Any) -> Any:
         raise RuntimeError("world down for one tick")
 
-    p.world.step = boom  # type: ignore[method-assign, assignment]
+    p.surprise.step = boom  # type: ignore[method-assign, assignment]
     p.step()  # a degraded first tick is always recorded as a command transition
-    p.world.step = real_world  # type: ignore[method-assign]
+    p.surprise.step = real_step  # type: ignore[method-assign]
     for _ in range(24):
         p.step()
     spool = tmp_path / "spool"

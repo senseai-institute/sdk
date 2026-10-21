@@ -33,7 +33,7 @@ def test_no_drops_at_100_ticks_per_second(config: Config) -> None:
     assert wait_until(lambda: r.finished, timeout=10.0)
     r.stop()
     drops = r.drops()
-    assert drops == {"tokens": 0, "world": 0, "reflex": 0, "cortex": 0}
+    assert drops == {"tokens": 0, "surprise": 0, "reflex": 0, "cortex": 0}
     assert p.ticks >= 50  # 50 ticks of data; watchdog ticks on the wall clock may add a few
     with_surprise = [
         c for c in cmds if not isinstance(c, FallbackCommand) and c.provenance.surprise_tick_index
@@ -52,15 +52,15 @@ def test_stalled_world_degrades_to_brake_within_budget(config: Config) -> None:
     )
     p = Pipeline.from_config(config, bridge=bridge)
     p.on_command(lambda c: cmds.append((time.monotonic(), c)))
-    real_step = p.world.step
+    real_step = p.surprise.step
     stall_from: list[float | None] = [None]
 
-    def slow(batch: Any) -> Any:
+    def slow(maps: Any, batch: Any) -> Any:
         if stall_from[0] is not None:
             time.sleep(0.4)
-        return real_step(batch)
+        return real_step(maps, batch)
 
-    p.world.step = slow  # type: ignore[method-assign]
+    p.surprise.step = slow  # type: ignore[method-assign]
     r = ThreadedRunner(p)
     r.start()
     assert wait_until(lambda: p.ticks >= 10, timeout=5.0)

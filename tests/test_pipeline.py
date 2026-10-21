@@ -45,7 +45,7 @@ def test_build_verifies_artefacts(config: Config) -> None:
     p = Pipeline.from_config(config)
     assert p.artefacts["world"].id == "world-v0.0"
     assert p.artefacts["reflex"].id == "reflex-v0.0"
-    assert p.world.tokenizer_id == p.tokens.tokenizer_id
+    assert p.surprise.tokenizer_id == p.tokens.tokenizer_id and p.world is p.surprise
     assert p.reflex.available is True  # senseai-reflex is a dependency
     assert p.cortex.available is False
 
@@ -78,9 +78,17 @@ def test_replay_runs_to_end_and_commands_every_tick(config: Config) -> None:
     # degraded only because senseai-cortex is not built yet; nothing about reflex
     assert all("cortex" in x for x in h.reasons), h.reasons
     assert h.ticks == 50
-    assert [s.name for s in h.stages] == ["ingest", "tokens", "world", "reflex", "cortex", "sdk"]
+    assert [s.name for s in h.stages] == [
+        "ingest",
+        "circuits",
+        "tokens",
+        "surprise",
+        "reflex",
+        "cortex",
+        "sdk",
+    ]
     assert h.stages[2].p99_ms > 0
-    assert h.to_json()["stages"][1]["name"] == "tokens"
+    assert h.to_json()["stages"][2]["name"] == "tokens"
     assert "degraded" in h.summary()
 
 
@@ -91,7 +99,11 @@ def test_single_loop_is_deterministic(config: Config) -> None:
 
 
 def test_matches_running_the_packages_by_hand(config: Config) -> None:
-    """The SDK adds nothing: its surprise series equals ingest → tokens → world called directly."""
+    """The SDK adds nothing: its surprise series equals ingest → circuits + tokens → world called directly."""
+    import numpy as np
+    from senseai_circuits.grid import GridGeometry
+    from senseai_circuits.stage import CircuitStage as L1Circuits
+    from senseai_circuits.stage import SurpriseFromCircuits
     from senseai_ingest.sync import Aligner, AlignerConfig
     from senseai_tokens.config import TokenizerConfig
     from senseai_tokens.tokenizer import Tokenizer
@@ -108,18 +120,29 @@ def test_matches_running_the_packages_by_hand(config: Config) -> None:
     al = Aligner(ads, AlignerConfig(tick_ns=config.tick_ns, speed=0.0))
     al.open()
     tok.set_specs(al.specs())
+    head = tok.heads["event"].cfg
+    l1 = L1Circuits(tick_ns=config.tick_ns)
+    fov, px = head.default_fov_deg, head.voxel_px  # type: ignore[attr-defined]
+    l1.add_source("dvs0", GridGeometry.from_camera(tok.frame.camera("dvs0", fov), px))
+    l1.set_specs(al.specs())
+    sfc = SurpriseFromCircuits()
     by_hand = []
     for tick in al:
-        smap, _ = wm.step(tok(tick))
-        by_hand.append(smap)
+        maps = l1.step(tick)
+        batch = tok(tick)
+        s_c = sfc.step(maps, batch)
+        s_l, _ = wm.step(batch)
+        by_hand.append((s_l, s_c))
     al.close()
     assert len(by_hand) == len(results)
-    for r, s in zip(results, by_hand, strict=True):
+    for r, (s_l, s_c) in zip(results, by_hand, strict=True):
         got = r.surprise
         assert got is not None
-        assert got.t_master_ns == s.t_master_ns
-        assert (got.per_cell == s.per_cell).all()
-        assert got.global_surprise == s.global_surprise
+        assert got.t_master_ns == s_c.t_master_ns
+        assert got.global_surprise == max(s_l.global_surprise, s_c.global_surprise)
+        assert (got.per_token == np.maximum(s_l.per_token, s_c.per_token)).all()
+        assert (got.per_bearing == np.maximum(s_l.per_bearing, s_c.per_bearing)).all()
+        assert got.provenance.model_id == f"{wm.model_id}+{sfc.model_id}"
 
 
 def test_stage_failure_degrades_and_watchdog_brakes(config: Config) -> None:
@@ -128,16 +151,17 @@ def test_stage_failure_degrades_and_watchdog_brakes(config: Config) -> None:
     p = Pipeline.from_config(config)
     p.step()
 
-    def boom(_batch: Any) -> Any:
+    def boom(_maps: Any, _batch: Any) -> Any:
         raise RuntimeError("world exploded")
 
-    p.world.step = boom  # type: ignore[method-assign, assignment]
+    p.surprise.step = boom  # type: ignore[method-assign, assignment]
     r = p.step()
     assert r.degraded and r.surprise is None
-    assert any("world stage failed: RuntimeError: world exploded" in x for x in r.reasons)
+    assert any("surprise stage failed: RuntimeError: world exploded" in x for x in r.reasons)
     h = p.health()
     assert h.state == "degraded"
-    assert h.stages[2].errors == 1 and "world exploded" in (h.stages[2].last_error or "")
+    assert h.stages[3].name == "surprise"
+    assert h.stages[3].errors == 1 and "world exploded" in (h.stages[3].last_error or "")
     # reflex's envelope watchdog takes over: slow after 50 ms without a map, brake after 250 ms
     later = [p.step() for _ in range(30)]
     assert any(x.command.provenance.degraded and x.command.action == "slow" for x in later)
@@ -267,3 +291,79 @@ def test_dsec_replay_end_to_end_with_profiles(
         assert not any(isinstance(r.command, FallbackCommand) for r in results)
         assert {r.command.provenance.profile_name for r in results} == {name}
         assert all(r.surprise is not None for r in results)
+
+
+def test_world_null_runs_the_l1_circuits_end_to_end(
+    store: Path, tmp_path: Path, trust_release_key: None, licence_key: str
+) -> None:
+    """``artefacts.world: null``: the fixture end to end on the circuits alone, no learned model."""
+    from senseai_circuits import __version__ as circuits_version
+
+    d = base_config(store, tmp_path / "cache", licence_key=licence_key, world=None)
+    assert d["artefacts"]["world"] is None and d["artefacts"]["tokens"] == "tokens-v0.0"
+    p = Pipeline.from_config(Config.from_mapping(d, env={}, base=tmp_path))
+    assert p.surprise.model is None and set(p.artefacts) == {"tokens", "reflex"}
+    results = run_all(p)
+    assert len(results) == 50
+    assert all(r.surprise is not None for r in results)
+    maps = [r.surprise for r in results if r.surprise is not None]
+    assert {m.provenance.model_id for m in maps} == {f"circuits-{circuits_version}"}
+    assert any(m.warming_up for m in maps[:10]) and not maps[-1].warming_up
+    assert maps[-1].has_bin_stats and maps[-1].per_bearing.shape == (72,)
+    assert not any(isinstance(r.command, FallbackCommand) for r in results)
+    assert {"circuits", "tokens", "surprise", "reflex"} <= set(results[-1].latency_ns)
+    assert results[-1].command.provenance.surprise_source_id == f"circuits-{circuits_version}"
+    st = p.state()
+    assert st["artefacts"] == {"tokens": "tokens-v0.0", "reflex": "reflex-v0.0"} and st["circuits"]
+    p2 = Pipeline.from_config(Config.from_mapping(d, env={}, base=tmp_path))
+    p2.restore(st)
+
+
+def test_world_null_needs_a_tokens_artefact(store: Path, tmp_path: Path, licence_key: str) -> None:
+    from senseai_sdk.errors import ConfigError
+
+    d = base_config(store, tmp_path / "cache", licence_key=licence_key, world=None)
+    del d["artefacts"]["tokens"]
+    with pytest.raises(ConfigError, match=r"tokens: required when artefacts\.world is null"):
+        Config.from_mapping(d, env={}, base=tmp_path)
+    d["artefacts"].pop("world")
+    with pytest.raises(ConfigError, match="world: required"):
+        Config.from_mapping(d, env={}, base=tmp_path)
+
+
+def test_circuit_knobs_come_from_the_active_profile(
+    tmp_path: Path, release_key: Any, licence_key: str, trust_release_key: None
+) -> None:
+    """A profile spec's ``circuits:`` block (what senseai-studio shows) sets the knobs the SDK runs."""
+    import shutil
+    import subprocess
+    import sys
+
+    from senseai_profiles.spec import ProfileSpec
+
+    from senseai_sdk.testing import PROFILES_REPO, build_fixture_store
+
+    if "circuits" not in ProfileSpec.__dataclass_fields__:
+        pytest.skip("this senseai-profiles predates the spec's circuits: block (profiles#9)")
+    repo = tmp_path / "profiles"
+    shutil.copytree(PROFILES_REPO, repo, ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__"))
+    pkg = repo / "packages" / "senseai-profiles"
+    spec = pkg / "profiles" / "panther.profile.yaml"
+    spec.write_text(spec.read_text() + "\ncircuits:\n  cs.sigma_center_deg: 0.7\n  emd.delay_tau_ms: 40.0\n")
+    subprocess.run(
+        [sys.executable, "-m", "senseai_profiles.cli", "--root", str(repo), "--sensors", "../../sensors",
+         "distill", "panther", "--out", "priors"],
+        cwd=pkg, check=True, capture_output=True,
+    )  # fmt: skip
+    store = build_fixture_store(tmp_path / "store", release_key, profiles_repo=repo)
+    d = base_config(store, tmp_path / "cache", licence_key=licence_key, world=None)
+    d["profile"] = {"name": "panther"}
+    p = Pipeline.from_config(Config.from_mapping(d, env={}, base=tmp_path))
+    assert p.circuits.params.cs_sigma_center_deg == 0.7 and p.circuits.params.emd_delay_tau_ms == 40.0
+    assert p.surprise.l1.params == p.circuits.params
+    results = [p.step() for _ in range(20)]
+    assert all(r.surprise is not None for r in results)
+    # back to the null profile: registry defaults again
+    p.load_profile("null")
+    p.step()
+    assert p.circuits.params.cs_sigma_center_deg == 0.5

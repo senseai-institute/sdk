@@ -1,5 +1,9 @@
 # Copyright SenseAI Institute. Licensed under the Apache License, Version 2.0.
-"""Wires ingest → tokens → profiles → world → reflex → bridge → cortex.
+"""Wires ingest → circuits → tokens → profiles → surprise → reflex → bridge → cortex.
+
+``circuits`` is the L1 producer (senseai-circuits): every event camera through fixed,
+weight-free circuits. ``surprise`` turns its maps and the tick's tokens into the
+``SurpriseMap``, fused with the learned world model when ``artefacts.world`` is set.
 
 Single-loop mode: :meth:`Pipeline.step` runs one tick through every stage, in order, on the
 calling thread. It is deterministic. Threaded mode (:mod:`senseai_sdk.threaded`) runs the
@@ -29,14 +33,15 @@ from senseai_sdk.config import Config
 from senseai_sdk.errors import ArtefactError, PipelineError
 from senseai_sdk.health import Health, LatencyRing, StageStats
 from senseai_sdk.stages import (
+    CircuitStage,
     CortexStage,
     FallbackCommand,
     IngestStage,
     MotionContext,
     ProfilesStage,
     ReflexStage,
+    SurpriseStage,
     TokensStage,
-    WorldStage,
     load_calibration,
 )
 
@@ -81,9 +86,10 @@ class Pipeline:
         cfg: Config,
         *,
         ingest: IngestStage,
+        circuits: CircuitStage,
         tokens: TokensStage,
         profiles: ProfilesStage,
-        world: WorldStage,
+        surprise: SurpriseStage,
         reflex: ReflexStage,
         cortex: CortexStage,
         bridge: BridgeLike,
@@ -92,8 +98,8 @@ class Pipeline:
         licence_state: LicenceState | None = None,
     ) -> None:
         self.cfg = cfg
-        self.ingest, self.tokens, self.profiles = ingest, tokens, profiles
-        self.world, self.reflex, self.cortex = world, reflex, cortex
+        self.ingest, self.circuits, self.tokens, self.profiles = ingest, circuits, tokens, profiles
+        self.surprise, self.reflex, self.cortex = surprise, reflex, cortex
         self.bridge = bridge
         self.artefacts = dict(artefacts)
         self.store = store
@@ -119,6 +125,11 @@ class Pipeline:
         self.keep_ticks = False
         self.taps: list[Callable[[StepResult], None]] = []  # telemetry, metering, audit
 
+    @property
+    def world(self) -> SurpriseStage:
+        """The surprise stage under its pre-L1 name (it replaced ``WorldStage``)."""
+        return self.surprise
+
     # -- construction -----------------------------------------------------------------------
 
     @classmethod
@@ -140,25 +151,31 @@ class Pipeline:
             PipelineError: A sensor adapter rejects its options, a calibration file is missing.
         """
         store = store or ArtefactStore(cfg.artefacts.store, cfg.artefacts.cache)
-        world_art = store.fetch(cfg.artefacts.world)
+        world_art = store.fetch(cfg.artefacts.world) if cfg.artefacts.world else None
         reflex_art = store.fetch(cfg.artefacts.reflex)
-        for name in ("checkpoint.ckpt", "tokens.yaml"):
-            if name not in world_art.files:
-                raise ArtefactError(f"{world_art.id}: world artefact has no {name}")
+        tokens_art = store.fetch(cfg.artefacts.tokens) if cfg.artefacts.tokens else world_art
+        assert tokens_art is not None  # config guarantees world or tokens
+        if world_art is not None and "checkpoint.ckpt" not in world_art.files:
+            raise ArtefactError(f"{world_art.id}: world artefact has no checkpoint.ckpt")
+        if "tokens.yaml" not in tokens_art.files:
+            raise ArtefactError(f"{tokens_art.id}: {tokens_art.kind} artefact has no tokens.yaml")
         tokens = TokensStage(
-            world_art, load_calibration(cfg.sensors), device="cpu" if device == "auto" else device
+            tokens_art, load_calibration(cfg.sensors), device="cpu" if device == "auto" else device
         )
-        world = WorldStage(world_art, device=device)
-        if world.tick_ns != cfg.tick_ns:
-            raise ArtefactError(
-                f"tick_ms: config says {cfg.tick_ms} ms but {world_art.id} was trained at "
-                f"{world.tick_ns // 1_000_000} ms; they must match"
-            )
-        if world.tokenizer_id and world.tokenizer_id != tokens.tokenizer_id:
-            raise ArtefactError(
-                f"{world_art.id}: checkpoint expects tokenizer {world.tokenizer_id!r} but its tokens.yaml "
-                f"builds {tokens.tokenizer_id!r}; the artefact is inconsistent"
-            )
+        # circuit knobs come from the active profile (ProfilesStage.circuit_params); defaults until one loads
+        surprise = SurpriseStage(world_art, None, device=device)  # top-k budget: each batch's global_budget
+        if world_art is not None:
+            if surprise.tick_ns != cfg.tick_ns:
+                raise ArtefactError(
+                    f"tick_ms: config says {cfg.tick_ms} ms but {world_art.id} was trained at "
+                    f"{(surprise.tick_ns or 0) // 1_000_000} ms; they must match"
+                )
+            if surprise.tokenizer_id and surprise.tokenizer_id != tokens.tokenizer_id:
+                raise ArtefactError(
+                    f"{world_art.id}: checkpoint expects tokenizer {surprise.tokenizer_id!r} but its "
+                    f"tokens.yaml builds {tokens.tokenizer_id!r}; the artefact is inconsistent"
+                )
+        circuits = CircuitStage(None, tick_ns=cfg.tick_ns)
         ingest = IngestStage(cfg)
         profiles = ProfilesStage([s.spec for s in cfg.sensors if s.spec], priors_key=priors_key)
         reflex = ReflexStage(reflex_art, cfg.robot, cfg.reflex.max_lateral_m)
@@ -168,13 +185,22 @@ class Pipeline:
         p = cls(
             cfg,
             ingest=ingest,
+            circuits=circuits,
             tokens=tokens,
             profiles=profiles,
-            world=world,
+            surprise=surprise,
             reflex=reflex,
             cortex=cortex,
             bridge=bridge,
-            artefacts={"world": world_art, "reflex": reflex_art},
+            artefacts={
+                k: a
+                for k, a in (
+                    ("world", world_art),
+                    ("tokens", tokens_art if tokens_art is not world_art else None),
+                    ("reflex", reflex_art),
+                )
+                if a is not None
+            },
             store=store,
             licence_state=licence_state,
         )
@@ -217,6 +243,9 @@ class Pipeline:
         return versions[-1]
 
     def _set_profile(self, profile: Any | None) -> None:
+        params = self.profiles.circuit_params(profile)
+        self.circuits.set_params(params)
+        self.surprise.set_params(params)
         if profile is None:
             self.tokens.tokenizer.set_profile(None)
             self.reflex.set_profile(None)
@@ -291,7 +320,9 @@ class Pipeline:
         if self._opened:  # re-open in the other pacing mode (replay only; live sources ignore pacing)
             self.ingest.close()
         self.ingest.open(paced=paced)
-        self.tokens.set_specs(self.ingest.specs())
+        specs = self.ingest.specs()
+        self.tokens.set_specs(specs)
+        self.circuits.set_specs(specs, self.tokens.tokenizer)
         self._opened = True
 
     def close(self) -> None:
@@ -329,6 +360,14 @@ class Pipeline:
         lat["ingest"] = self._lat(self.ingest.stats)
         t_ns = int(tick.t_master_ns)
 
+        maps = self._guard(
+            self.circuits.stats,
+            lambda: self.circuits.step(tick, self.motion.yaw_rate_rps),
+            reasons,
+            "circuits",
+        )
+        if maps is not None:
+            lat["circuits"] = self._lat(self.circuits.stats)
         batch = self._guard(self.tokens.stats, lambda: self.tokens.step(tick), reasons, "tokens")
         if batch is not None:
             lat["tokens"] = self._lat(self.tokens.stats)
@@ -340,11 +379,13 @@ class Pipeline:
             )
 
         surprise = world_state = None
-        if batch is not None:
-            out = self._guard(self.world.stats, lambda: self.world.step(batch), reasons, "world")
+        if batch is not None or maps is not None:
+            out = self._guard(
+                self.surprise.stats, lambda: self.surprise.step(maps, batch), reasons, "surprise"
+            )
             if out is not None:
                 surprise, world_state = out
-                lat["world"] = self._lat(self.world.stats)
+                lat["surprise"] = self._lat(self.surprise.stats)
 
         t_sensor = oldest_sample_ns(tick)
         cmd, actuator, t_emit = self.reflex_path(surprise, t_ns, lat, reasons, t_sensor_ns=t_sensor)
@@ -462,22 +503,25 @@ class Pipeline:
             "artefacts": {k: a.id for k, a in self.artefacts.items()},
             "profile": list(self.profiles.active_ref),
             "ticks": self.ticks,
+            "circuits": self.circuits.state(),
             "tokens": self.tokens.state(),
-            "world": self.world.state(),
+            "surprise": self.surprise.state(),
             "reflex": self.reflex.state(),
             "cortex": self.cortex.state(),
         }
 
     def restore(self, state: Mapping[str, Any]) -> None:
         """Restore :meth:`state` between ticks."""
-        mine = {k: a.id for k, a in self.artefacts.items() if k in ("world", "reflex")}
-        theirs = {k: v for k, v in state.get("artefacts", {}).items() if k in ("world", "reflex")}
+        kinds = ("world", "tokens", "reflex")
+        mine = {k: a.id for k, a in self.artefacts.items() if k in kinds}
+        theirs = {k: v for k, v in state.get("artefacts", {}).items() if k in kinds}
         if theirs != mine:
             raise ArtefactError(f"state was saved with artefacts {theirs}, this pipeline runs {mine}")
 
         def apply(p: Pipeline) -> None:
+            p.circuits.restore(state.get("circuits", b""))
             p.tokens.restore(state["tokens"])
-            p.world.restore(state["world"])
+            p.surprise.restore(state["surprise"])
             p.reflex.restore(state.get("reflex", b""))
             p.cortex.restore(state.get("cortex", b""))
             p.ticks = int(state.get("ticks", 0))
@@ -487,7 +531,8 @@ class Pipeline:
     def health(self) -> Health:
         """Current health. Cheap."""
         stages = [
-            s.stats.snapshot() for s in (self.ingest, self.tokens, self.world, self.reflex, self.cortex)
+            s.stats.snapshot()
+            for s in (self.ingest, self.circuits, self.tokens, self.surprise, self.reflex, self.cortex)
         ]
         stages.append(self.sdk_stats.snapshot())
         reasons = list(self._last_reasons)

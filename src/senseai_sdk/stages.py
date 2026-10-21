@@ -15,6 +15,7 @@ argument mapping change.
 from __future__ import annotations
 
 import contextlib
+import json
 import pickle
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import yaml
 
 from senseai_sdk import adapters as adapter_table
@@ -31,6 +33,7 @@ from senseai_sdk.errors import ArtefactError, PipelineError
 from senseai_sdk.health import StageStats
 
 __all__ = [
+    "CircuitStage",
     "CortexStage",
     "FallbackCommand",
     "IngestStage",
@@ -38,8 +41,8 @@ __all__ = [
     "ProfilesStage",
     "Provenance",
     "ReflexStage",
+    "SurpriseStage",
     "TokensStage",
-    "WorldStage",
 ]
 
 Action = Literal["none", "slow", "brake", "swerve", "retract", "hold"]
@@ -224,17 +227,20 @@ class IngestStage:
 
 
 class TokensStage:
-    """The ``senseai_tokens.Tokenizer`` built from the world artefact's ``tokens.yaml``."""
+    """The ``senseai_tokens.Tokenizer`` built from an artefact's ``tokens.yaml``.
+
+    That artefact is the world bundle when one is configured, else ``artefacts.tokens``.
+    """
 
     name = "tokens"
 
-    def __init__(self, world: Artefact, calibration: Mapping[str, Any] | None, device: str = "cpu") -> None:
+    def __init__(self, source: Artefact, calibration: Mapping[str, Any] | None, device: str = "cpu") -> None:
         from senseai_tokens.config import TokenizerConfig
         from senseai_tokens.frame import BodyFrame
         from senseai_tokens.tokenizer import Tokenizer
 
         self.stats = StageStats(self.name)
-        tcfg = TokenizerConfig.from_yaml(world.path("tokens.yaml"))
+        tcfg = TokenizerConfig.from_yaml(source.path("tokens.yaml"))
         frame = BodyFrame.from_dict(calibration) if calibration else None
         self.tokenizer = Tokenizer(tcfg, calibration=frame, device=device)
         self.tokenizer_id: str = self.tokenizer.tokenizer_id
@@ -274,6 +280,7 @@ class ProfilesStage:
         self._spec_ids = tuple(sensor_spec_ids)
         self._key = priors_key
         self._registries: dict[str, Any] = {}
+        self._roots: dict[str, Path] = {}  # profile name -> the artefact it was loaded from
         self.active: Any = None
         self.active_ref: tuple[str, int] = ("null", 0)
         self._pending_scene: dict[str, Any] = {}
@@ -299,7 +306,30 @@ class ProfilesStage:
         except RegistryError as e:
             raise ArtefactError(f"{artefact.id}: {e}") from e
         self._registries[artefact.id] = reg
+        self._roots[name] = root
         return prof
+
+    def circuit_params(self, profile: Any | None) -> Any:
+        """The species' circuit knobs, from where its profile keeps them (what senseai-studio shows).
+
+        The profile spec's ``circuits:`` section wins over the newest prior bundle's
+        ``meta["circuits"]``; anything unset keeps the registry default. ``None``: all defaults.
+        """
+        from senseai_circuits.params import CircuitParams
+
+        if profile is None or profile.name not in self._roots:
+            return CircuitParams()
+        root = self._roots[profile.name]
+        spec_file = root / "profiles" / f"{profile.name}.profile.yaml"
+        spec = yaml.safe_load(spec_file.read_text()) if spec_file.is_file() else None
+        meta = None
+        for b in sorted((root / "priors").glob(f"{profile.name}.v*.json"), reverse=True):
+            with contextlib.suppress(OSError, ValueError):
+                meta = json.loads(b.read_text())
+                break
+        return CircuitParams.from_profile(
+            spec if isinstance(spec, Mapping) else None, meta if isinstance(meta, Mapping) else None
+        )
 
     def activate(self, profile: Any, tokenizer: Any, reflex: Any | None) -> None:
         """Install ``profile`` on the tokenizer and reflex. Between ticks only."""
@@ -334,33 +364,192 @@ class ProfilesStage:
             pass
 
 
-# -- world ------------------------------------------------------------------------------------
+# -- circuits (L1) ---------------------------------------------------------------------------
 
 
-class WorldStage:
-    """The ``senseai_world.WorldModel`` loaded from the world artefact's checkpoint."""
+class CircuitStage:
+    """``senseai_circuits.CircuitStage``: every event camera through the L1 circuits, before tokens.
 
-    name = "world"
+    Camera geometry is the tokenizer's own (its ``BodyFrame`` camera at the event head's voxel
+    size), so an event token's ray passes through the circuit cell it is scored by. The ego yaw
+    rate comes from the tick's IMU samples, or from ``update_context(yaw_rate=...)`` without IMU.
+    """
 
-    def __init__(self, world: Artefact, device: str = "auto") -> None:
-        from senseai_world.inference import WorldModel
+    name = "circuits"
 
+    def __init__(self, params: Any = None, *, tick_ns: int, n_bearing: int = 72) -> None:
+        from senseai_circuits.blas import limit_blas_threads
+        from senseai_circuits.stage import CircuitStage as L1Circuits
+
+        # the circuits' matrices are small; multi-threaded OpenBLAS workers would spin and starve the
+        # other stages (measured: the learned model's step doubled, 5 -> 10 ms, on 4 cores)
+        limit_blas_threads(1)
         self.stats = StageStats(self.name)
-        self.model = WorldModel.load(world.path("checkpoint.ckpt"), device=device)
-        self.tick_ns: int = int(self.model.cfg.tick_ns or 0)
-        self.tokenizer_id: str | None = self.model.tokenizer_id
+        self._tick_ns, self._n_bearing = tick_ns, n_bearing
+        self._specs: Mapping[str, Any] | None = None
+        self._tokenizer: Any = None
+        self.stage = L1Circuits(params, tick_ns=tick_ns, n_bearing=n_bearing)
 
-    def step(self, batch: Any) -> tuple[Any, Any]:
-        """``TokenBatch`` → ``(SurpriseMap, WorldState | None)``."""
-        return _timed(self.stats, lambda: self.model.step(batch))  # type: ignore[no-any-return]
+    @property
+    def params(self) -> Any:
+        """The ``CircuitParams`` the circuits run with."""
+        return self.stage.params
+
+    def set_params(self, params: Any) -> None:
+        """New knob values (a profile switch): rebuild the circuits, which restarts their state."""
+        from senseai_circuits.stage import CircuitStage as L1Circuits
+
+        if params == self.stage.params:
+            return
+        self.stage = L1Circuits(params, tick_ns=self._tick_ns, n_bearing=self._n_bearing)
+        if self._specs is not None:
+            self.set_specs(self._specs, self._tokenizer)
+
+    def set_specs(self, specs: Mapping[str, Any], tokenizer: Any | None = None) -> None:
+        """One circuit chain per EVENT source; geometry from the tokenizer's calibration when it has one."""
+        from senseai_circuits.grid import GridGeometry
+
+        self._specs, self._tokenizer = specs, tokenizer
+
+        head = getattr(tokenizer, "heads", {}).get("event") if tokenizer is not None else None
+        cell_px = int(getattr(getattr(head, "cfg", None), "voxel_px", self.stage.cell_px))
+        fov = getattr(getattr(head, "cfg", None), "default_fov_deg", None)
+        self.stage.cell_px, self.stage.default_fov_deg = cell_px, fov
+        for sid, spec in specs.items():
+            if str(getattr(spec, "modality", "")) != "event" or sid in self.stage.chains:
+                continue
+            if tokenizer is not None:
+                with contextlib.suppress(Exception):  # no calibration: fall back to the spec's meta
+                    cam = tokenizer.frame.camera(sid, default_fov_deg=fov)
+                    self.stage.add_source(sid, GridGeometry.from_camera(cam, cell_px))
+                    continue
+        self.stage.set_specs(specs)
+
+    def step(self, tick: Any, yaw_rate_rps: float = 0.0) -> Any:
+        """``AlignedTick`` → ``CircuitMaps``."""
+        yaw = None if self.stage.imu_sources else yaw_rate_rps
+        return _timed(self.stats, lambda: self.stage.step(tick, ego_yaw_rps=yaw))
 
     def state(self) -> bytes:
-        """Checkpointable window and normaliser state."""
-        return bytes(self.model.checkpoint_state())
+        """Circuit state (adaptation, delays, last grid)."""
+        return bytes(self.stage.state())
 
     def restore(self, blob: bytes) -> None:
         """Restore :meth:`state`."""
-        self.model.restore_state(blob)
+        if blob:
+            self.stage.restore(blob)
+
+
+# -- surprise ---------------------------------------------------------------------------------
+
+
+class SurpriseStage:
+    """The ``SurpriseMap`` producer: the L1 circuits always, the learned world model when configured.
+
+    With no world artefact the map is ``senseai_circuits.SurpriseFromCircuits`` alone
+    (``provenance.model_id == "circuits-<version>"``). With one, both run and are fused the way
+    ``senseai_world.prior.fused.FusedWorldModel`` fuses prior and learned model: element-wise
+    ``max`` of the per-token z-scores and of the per-bin maps, ``max`` of the globals, both
+    normalisers in ``scale`` under ``learned.`` and ``circuits.``, and ``WorldState`` from the
+    learned model.
+    """
+
+    name = "surprise"
+
+    def __init__(
+        self,
+        world: Artefact | None,
+        params: Any = None,
+        *,
+        tokens_per_tick: int | None = None,
+        device: str = "auto",
+    ) -> None:
+        from senseai_circuits.stage import SurpriseFromCircuits
+
+        self.stats = StageStats(self.name)
+        self._tokens_per_tick = tokens_per_tick
+        self.l1 = SurpriseFromCircuits(params, tokens_per_tick=tokens_per_tick)
+        self.model: Any = None
+        self.tick_ns: int | None = None
+        self.tokenizer_id: str | None = None
+        if world is not None:
+            from senseai_world.inference import WorldModel
+
+            self.model = WorldModel.load(world.path("checkpoint.ckpt"), device=device)
+            self.tick_ns = int(self.model.cfg.tick_ns or 0)
+            self.tokenizer_id = self.model.tokenizer_id
+        self.model_id: str = (
+            self.l1.model_id if self.model is None else f"{self.model.model_id}+{self.l1.model_id}"
+        )
+
+    def set_params(self, params: Any) -> None:
+        """New knob values (a profile switch): a fresh L1 producer, which warms up again."""
+        from senseai_circuits.stage import SurpriseFromCircuits
+
+        if params != self.l1.params:
+            self.l1 = SurpriseFromCircuits(params, tokens_per_tick=self._tokens_per_tick)
+
+    @property
+    def device(self) -> str:
+        """Where the learned model runs (``cpu`` when there is none: the circuits are host NumPy)."""
+        return "cpu" if self.model is None else str(self.model.device)
+
+    def step(self, maps: Any, batch: Any) -> tuple[Any, Any]:
+        """``(CircuitMaps, TokenBatch)`` → ``(SurpriseMap, WorldState | None)``."""
+        return _timed(self.stats, lambda: self._step(maps, batch))  # type: ignore[no-any-return]
+
+    def _step(self, maps: Any, batch: Any) -> tuple[Any, Any]:
+        if maps is None:
+            if self.model is None or batch is None:
+                raise PipelineError("no circuit maps this tick")
+            learned: tuple[Any, Any] = self.model.step(batch)
+            return learned
+        s_c = self.l1.step(maps, batch)
+        if self.model is None or batch is None:
+            return s_c, None
+        s_l, state = self.model.step(batch)
+        return self._fuse(s_l, s_c), state
+
+    def _fuse(self, s_l: Any, s_c: Any) -> Any:
+        from senseai_circuits.contract import Provenance, SurpriseMap
+
+        scale = {f"learned.{k}": v for k, v in s_l.scale.items()}
+        scale.update({f"circuits.{k}": v for k, v in s_c.scale.items()})
+        warming = bool(s_l.warming_up or s_c.warming_up)
+        scale["warming_up"] = 1.0 if warming else 0.0
+        heads = dict(s_c.per_head)
+        for h, v in s_l.per_head.items():
+            heads[h] = max(v, heads.get(h, 0.0))
+        return SurpriseMap(
+            t_master_ns=s_c.t_master_ns,
+            per_token=np.maximum(s_l.per_token, s_c.per_token).astype(np.float32),
+            per_cell=np.maximum(s_l.per_cell, s_c.per_cell),
+            per_bearing=np.maximum(s_l.per_bearing, s_c.per_bearing),
+            per_head=heads,
+            global_surprise=max(float(s_l.global_surprise), float(s_c.global_surprise)),
+            scale=scale,
+            latency_ns=int(s_l.latency_ns) + int(s_c.latency_ns),
+            warming_up=warming,
+            tick_index=s_c.tick_index,
+            grid_half_extent_m=s_c.grid_half_extent_m,
+            provenance=Provenance(model_id=self.model_id, tokenizer_id=s_c.provenance.tokenizer_id),
+            cell_count=np.maximum(s_l.cell_count, s_c.cell_count),
+            cell_max=np.maximum(s_l.cell_max, s_c.cell_max),
+            bearing_count=np.maximum(s_l.bearing_count, s_c.bearing_count),
+            bearing_max=np.maximum(s_l.bearing_max, s_c.bearing_max),
+        )
+
+    def state(self) -> bytes:
+        """Checkpointable normaliser state of both producers."""
+        learned = b"" if self.model is None else bytes(self.model.checkpoint_state())
+        return pickle.dumps({"circuits": self.l1.checkpoint_state(), "learned": learned})
+
+    def restore(self, blob: bytes) -> None:
+        """Restore :meth:`state` (our own checkpoint, never external input)."""
+        st = pickle.loads(blob)
+        self.l1.restore_state(st["circuits"])
+        if self.model is not None and st["learned"]:
+            self.model.restore_state(st["learned"])
 
 
 # -- reflex -----------------------------------------------------------------------------------

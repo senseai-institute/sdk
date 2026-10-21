@@ -89,7 +89,7 @@ def run_bench(
         p.ingest = IngestStage(cfg, tick_file=ticks_file)
     rings: dict[str, LatencyRing] = {
         k: LatencyRing(100_000)
-        for k in ("ingest", "tokens", "world", "reflex", "cortex", "bridge", "sdk", "total")
+        for k in ("ingest", "circuits", "tokens", "surprise", "reflex", "cortex", "bridge", "sdk", "total")
     }
     n = 0
     try:
@@ -117,14 +117,16 @@ def run_bench(
         notes.append("senseai-reflex not installed: the reflex row is the SDK watchdog, not a reflex")
     if not p.cortex.available:
         notes.append("senseai-cortex not installed: no cortex row")
-    if p.world.model.device.type == "cpu":
+    if p.surprise.model is None:
+        notes.append("no world artefact: the surprise row is the L1 circuits alone (NumPy, host)")
+    elif p.surprise.model.device.type == "cpu":
         notes.append("world ran on CPU; the ≤ 6 ms world budget assumes CUDA")
     return BenchResult(
         ticks=max(0, n - warmup),
         stages=stages,
         end_to_end_p99_ms=total_p99,
         sdk_overhead_p99_ms=stages.get("sdk", (0.0, 0.0))[1],
-        device=str(p.world.model.device),
+        device=p.surprise.device,
         reflex_installed=p.reflex.available,
         cortex_installed=p.cortex.available,
         warmup_ticks=min(warmup, n),

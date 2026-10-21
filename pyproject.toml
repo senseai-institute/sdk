@@ -29,6 +29,7 @@ dependencies = [
   "senseai-ingest @ git+https://github.com/senseai-institute/ingest@087b98408f4bcfd83f26ebb66dc4ed616441e341",
   "senseai-tokens @ git+https://github.com/senseai-institute/tokens@7b12b1e",
   "senseai-profiles @ git+https://github.com/senseai-institute/profiles@9ef8e20#subdirectory=packages/senseai-profiles",
+  "senseai-circuits @ git+https://github.com/senseai-institute/circuits@314732bf506ec67f4f1ccda55c45af1c3c852b44",
   "senseai-world @ git+https://github.com/senseai-institute/world@0a25692db8bd5df77039e2e4ed0998b59c079e1c",
   "senseai-reflex @ git+https://github.com/senseai-institute/reflex@9442c535a3122161a6be22fc51682d22d46e6ba8",
 ]
@@ -92,7 +93,7 @@ mypy_path = "src"
 module = ["h5py", "h5py.*", "rclpy", "rclpy.*", "launch", "launch.*", "launch_ros", "launch_ros.*",
           "geometry_msgs.*", "std_msgs.*", "cv2", "cv2.*",
           "senseai_reflex", "senseai_reflex.*", "senseai_cortex", "senseai_cortex.*",
-          "senseai_tokens.*", "senseai_world.*", "senseai_profiles.*", "senseai_ingest.*"]
+          "senseai_tokens.*", "senseai_world.*", "senseai_circuits", "senseai_circuits.*", "senseai_profiles.*", "senseai_ingest.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

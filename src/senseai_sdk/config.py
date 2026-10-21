@@ -62,14 +62,19 @@ class ProfileRef:
 
 @dataclass(frozen=True, slots=True)
 class ArtefactsConfig:
-    """``artefacts:`` — the signed proprietary bundles and where they live."""
+    """``artefacts:`` — the signed proprietary bundles and where they live.
 
-    world: str
+    ``world: null`` runs the L1 circuits alone (no learned model); the tokenizer's ``tokens.yaml``
+    then comes from ``tokens``, which is otherwise optional (the world bundle carries its own).
+    """
+
+    world: str | None
     reflex: str
     cache: Path = field(default_factory=lambda: Path("~/.senseai").expanduser())
     store: Path | str = field(  # a directory, or an HTTPS base URL
         default_factory=lambda: Path("~/.senseai/store").expanduser()
     )
+    tokens: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,7 +391,15 @@ def _profile(n: _Node) -> ProfileRef:
 
 
 def _artefacts(n: _Node) -> ArtefactsConfig:
-    n.check_keys(("world", "reflex", "cache", "store"))
+    n.check_keys(("world", "reflex", "tokens", "cache", "store"))
+    if "world" not in n.data:
+        raise ConfigError(f"{n._p('world')}: required (null runs the L1 circuits without a learned model)")
+    world = n.text("world")
+    tokens = n.text("tokens")
+    if world is None and tokens is None:
+        raise ConfigError(
+            f"{n._p('tokens')}: required when artefacts.world is null (the bundle with tokens.yaml)"
+        )
     cache = n.path("cache", default=Path("~/.senseai").expanduser())
     store_raw = n.data.get("store")
     store: Path | str
@@ -397,8 +410,9 @@ def _artefacts(n: _Node) -> ArtefactsConfig:
     else:
         store = n.path("store")
     return ArtefactsConfig(
-        world=n.text("world", required=True),
+        world=world,
         reflex=n.text("reflex", required=True),
+        tokens=tokens,
         cache=cache,
         store=store,
     )
@@ -541,7 +555,8 @@ licence_key: ${{SENSEAI_LICENCE}}     # ${{ENV}} is expanded; never commit a lit
 profile: {{name: panther, version: null}}   # version null = newest allowed; name null = no priors
 
 artefacts:
-  world: world-v1.2                 # signed world-model bundle (carries its tokenizer)
+  world: world-v1.2                 # signed world-model bundle (carries its tokenizer); null = circuits only
+  # tokens: tokens-v1.0             # tokenizer bundle (tokens.yaml); required when world is null
   reflex: reflex-v1.0               # signed reflex bundle
   cache: ~/.senseai                 # local cache; every load re-verifies signatures
   # store: https://artefacts.senseai.example/   # where to fetch from; default is <cache>/store
