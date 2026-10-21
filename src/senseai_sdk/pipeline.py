@@ -162,10 +162,8 @@ class Pipeline:
         tokens = TokensStage(
             tokens_art, load_calibration(cfg.sensors), device="cpu" if device == "auto" else device
         )
-        from senseai_circuits.params import CircuitParams
-
-        params = CircuitParams.from_bundle_meta(tokens_art.meta)
-        surprise = SurpriseStage(world_art, params, device=device)  # top-k budget: each batch's global_budget
+        # circuit knobs come from the active profile (ProfilesStage.circuit_params); defaults until one loads
+        surprise = SurpriseStage(world_art, None, device=device)  # top-k budget: each batch's global_budget
         if world_art is not None:
             if surprise.tick_ns != cfg.tick_ns:
                 raise ArtefactError(
@@ -177,7 +175,7 @@ class Pipeline:
                     f"{world_art.id}: checkpoint expects tokenizer {surprise.tokenizer_id!r} but its "
                     f"tokens.yaml builds {tokens.tokenizer_id!r}; the artefact is inconsistent"
                 )
-        circuits = CircuitStage(params, tick_ns=cfg.tick_ns)
+        circuits = CircuitStage(None, tick_ns=cfg.tick_ns)
         ingest = IngestStage(cfg)
         profiles = ProfilesStage([s.spec for s in cfg.sensors if s.spec], priors_key=priors_key)
         reflex = ReflexStage(reflex_art, cfg.robot, cfg.reflex.max_lateral_m)
@@ -245,6 +243,9 @@ class Pipeline:
         return versions[-1]
 
     def _set_profile(self, profile: Any | None) -> None:
+        params = self.profiles.circuit_params(profile)
+        self.circuits.set_params(params)
+        self.surprise.set_params(params)
         if profile is None:
             self.tokens.tokenizer.set_profile(None)
             self.reflex.set_profile(None)

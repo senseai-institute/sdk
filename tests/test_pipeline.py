@@ -329,3 +329,41 @@ def test_world_null_needs_a_tokens_artefact(store: Path, tmp_path: Path, licence
     d["artefacts"].pop("world")
     with pytest.raises(ConfigError, match="world: required"):
         Config.from_mapping(d, env={}, base=tmp_path)
+
+
+def test_circuit_knobs_come_from_the_active_profile(
+    tmp_path: Path, release_key: Any, licence_key: str, trust_release_key: None
+) -> None:
+    """A profile spec's ``circuits:`` block (what senseai-studio shows) sets the knobs the SDK runs."""
+    import shutil
+    import subprocess
+    import sys
+
+    from senseai_profiles.spec import ProfileSpec
+
+    from senseai_sdk.testing import PROFILES_REPO, build_fixture_store
+
+    if "circuits" not in ProfileSpec.__dataclass_fields__:
+        pytest.skip("this senseai-profiles predates the spec's circuits: block (profiles#9)")
+    repo = tmp_path / "profiles"
+    shutil.copytree(PROFILES_REPO, repo, ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__"))
+    pkg = repo / "packages" / "senseai-profiles"
+    spec = pkg / "profiles" / "panther.profile.yaml"
+    spec.write_text(spec.read_text() + "\ncircuits:\n  cs.sigma_center_deg: 0.7\n  emd.delay_tau_ms: 40.0\n")
+    subprocess.run(
+        [sys.executable, "-m", "senseai_profiles.cli", "--root", str(repo), "--sensors", "../../sensors",
+         "distill", "panther", "--out", "priors"],
+        cwd=pkg, check=True, capture_output=True,
+    )  # fmt: skip
+    store = build_fixture_store(tmp_path / "store", release_key, profiles_repo=repo)
+    d = base_config(store, tmp_path / "cache", licence_key=licence_key, world=None)
+    d["profile"] = {"name": "panther"}
+    p = Pipeline.from_config(Config.from_mapping(d, env={}, base=tmp_path))
+    assert p.circuits.params.cs_sigma_center_deg == 0.7 and p.circuits.params.emd_delay_tau_ms == 40.0
+    assert p.surprise.l1.params == p.circuits.params
+    results = [p.step() for _ in range(20)]
+    assert all(r.surprise is not None for r in results)
+    # back to the null profile: registry defaults again
+    p.load_profile("null")
+    p.step()
+    assert p.circuits.params.cs_sigma_center_deg == 0.5

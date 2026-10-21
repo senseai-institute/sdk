@@ -87,7 +87,7 @@ telemetry: {enabled: true, raw_frames: false, upload: null}
 | `profile.name` | str | `null` | Profile to load at start. `null` is the no-op profile and is always allowed. |
 | `profile.version` | int | newest allowed | Pins a profile version. A pinned version that is missing fails at start, never silently. |
 | `artefacts.world` | str \| null | required | World-model artefact id (`<name>-v<semver>`). Its bundle also carries the tokenizer config and weights the checkpoint was trained with, so you never configure the tokenizer yourself. `null` runs the L1 circuits alone (`SurpriseMap.provenance.model_id` is `circuits-<version>`); with a world artefact the two are fused (element-wise max, `model_id` `<world>+circuits-<version>`). |
-| `artefacts.tokens` | str | none | Tokenizer artefact (`tokens.yaml`; circuit knobs may sit in its manifest `meta["circuits"]`). Required when `artefacts.world` is null; otherwise the world bundle's tokenizer is used. |
+| `artefacts.tokens` | str | none | Tokenizer artefact (`tokens.yaml`). Required when `artefacts.world` is null; otherwise the world bundle's tokenizer is used. Circuit knob values come from the active profile (its spec's `circuits:` block, then its prior bundle's `meta["circuits"]`), the place senseai-studio shows them. |
 | `artefacts.reflex` | str | required | Reflex artefact id. |
 | `artefacts.cache` | path | `~/.senseai` | Local artefact cache. Artefacts are verified each time they load, not just when they are fetched. |
 | `artefacts.store` | path or URL | `${cache}/store` | Where artefacts are fetched from: a local directory or an HTTPS base URL. Profile bundles are `profile-<name>-v<N>` in the same store. |

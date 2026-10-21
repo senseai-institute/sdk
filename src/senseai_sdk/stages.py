@@ -15,6 +15,7 @@ argument mapping change.
 from __future__ import annotations
 
 import contextlib
+import json
 import pickle
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -279,6 +280,7 @@ class ProfilesStage:
         self._spec_ids = tuple(sensor_spec_ids)
         self._key = priors_key
         self._registries: dict[str, Any] = {}
+        self._roots: dict[str, Path] = {}  # profile name -> the artefact it was loaded from
         self.active: Any = None
         self.active_ref: tuple[str, int] = ("null", 0)
         self._pending_scene: dict[str, Any] = {}
@@ -304,7 +306,30 @@ class ProfilesStage:
         except RegistryError as e:
             raise ArtefactError(f"{artefact.id}: {e}") from e
         self._registries[artefact.id] = reg
+        self._roots[name] = root
         return prof
+
+    def circuit_params(self, profile: Any | None) -> Any:
+        """The species' circuit knobs, from where its profile keeps them (what senseai-studio shows).
+
+        The profile spec's ``circuits:`` section wins over the newest prior bundle's
+        ``meta["circuits"]``; anything unset keeps the registry default. ``None``: all defaults.
+        """
+        from senseai_circuits.params import CircuitParams
+
+        if profile is None or profile.name not in self._roots:
+            return CircuitParams()
+        root = self._roots[profile.name]
+        spec_file = root / "profiles" / f"{profile.name}.profile.yaml"
+        spec = yaml.safe_load(spec_file.read_text()) if spec_file.is_file() else None
+        meta = None
+        for b in sorted((root / "priors").glob(f"{profile.name}.v*.json"), reverse=True):
+            with contextlib.suppress(OSError, ValueError):
+                meta = json.loads(b.read_text())
+                break
+        return CircuitParams.from_profile(
+            spec if isinstance(spec, Mapping) else None, meta if isinstance(meta, Mapping) else None
+        )
 
     def activate(self, profile: Any, tokenizer: Any, reflex: Any | None) -> None:
         """Install ``profile`` on the tokenizer and reflex. Between ticks only."""
@@ -360,11 +385,31 @@ class CircuitStage:
         # other stages (measured: the learned model's step doubled, 5 -> 10 ms, on 4 cores)
         limit_blas_threads(1)
         self.stats = StageStats(self.name)
+        self._tick_ns, self._n_bearing = tick_ns, n_bearing
+        self._specs: Mapping[str, Any] | None = None
+        self._tokenizer: Any = None
         self.stage = L1Circuits(params, tick_ns=tick_ns, n_bearing=n_bearing)
+
+    @property
+    def params(self) -> Any:
+        """The ``CircuitParams`` the circuits run with."""
+        return self.stage.params
+
+    def set_params(self, params: Any) -> None:
+        """New knob values (a profile switch): rebuild the circuits, which restarts their state."""
+        from senseai_circuits.stage import CircuitStage as L1Circuits
+
+        if params == self.stage.params:
+            return
+        self.stage = L1Circuits(params, tick_ns=self._tick_ns, n_bearing=self._n_bearing)
+        if self._specs is not None:
+            self.set_specs(self._specs, self._tokenizer)
 
     def set_specs(self, specs: Mapping[str, Any], tokenizer: Any | None = None) -> None:
         """One circuit chain per EVENT source; geometry from the tokenizer's calibration when it has one."""
         from senseai_circuits.grid import GridGeometry
+
+        self._specs, self._tokenizer = specs, tokenizer
 
         head = getattr(tokenizer, "heads", {}).get("event") if tokenizer is not None else None
         cell_px = int(getattr(getattr(head, "cfg", None), "voxel_px", self.stage.cell_px))
@@ -422,6 +467,7 @@ class SurpriseStage:
         from senseai_circuits.stage import SurpriseFromCircuits
 
         self.stats = StageStats(self.name)
+        self._tokens_per_tick = tokens_per_tick
         self.l1 = SurpriseFromCircuits(params, tokens_per_tick=tokens_per_tick)
         self.model: Any = None
         self.tick_ns: int | None = None
@@ -435,6 +481,13 @@ class SurpriseStage:
         self.model_id: str = (
             self.l1.model_id if self.model is None else f"{self.model.model_id}+{self.l1.model_id}"
         )
+
+    def set_params(self, params: Any) -> None:
+        """New knob values (a profile switch): a fresh L1 producer, which warms up again."""
+        from senseai_circuits.stage import SurpriseFromCircuits
+
+        if params != self.l1.params:
+            self.l1 = SurpriseFromCircuits(params, tokens_per_tick=self._tokens_per_tick)
 
     @property
     def device(self) -> str:
